@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <inttypes.h>
+#include <ctype.h>
 
 typedef struct
 {
@@ -65,6 +65,12 @@ void assemble(FILE* in, FILE* out)
     while (fgets(line, sizeof(line), in))
     {
         line[strcspn(line, "\n")] = 0;
+
+
+        for(int i = 0; line[i]; i++)
+        {
+            line[i] = toupper(line[i]);
+        }
 
         char instr[16], reg[16], imm_str[32];
 
