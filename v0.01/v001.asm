@@ -1,0 +1,19 @@
+DEFAULT REL
+
+SECTION .data
+msg DB "Hello, World!", 10
+len EQU $ - msg
+
+SECTION .text
+GLOBAL _start
+
+_start:
+    MOV RAX, 1 ;; WRITE
+    MOV RDI, 1 ;; STDOUT
+    MOV RSI, msg ;; ADDRESS OF THE MESSAGE
+    MOV RDX, len ;; LENGTH OF THE MESSAGE
+    SYSCALL ;; MAKE THE SYSTEM CALL
+
+    MOV RAX, 60 ;; EXIT
+    XOR RDI, RDI ;; EXIT CODE 0
+    SYSCALL ;; MAKE THE SYSTEM CALL
