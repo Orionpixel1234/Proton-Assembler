@@ -36,15 +36,37 @@ read_loop:
     CMP RAX, 0               ;; EOF?
     JE done                  ;; IF ZERO, WE'RE DONE
 
+    MOV R8, RAX           ;; R8 = BYTES READ
+    LEA R9, [rel buffer]  ;; R9 = BUFFER START
+
+    MOV RCX, [rel buffer] ;; READ FIRST 8 BYTES INTO RCX FOR COMPARISON
+    CMP WORD CX, 'HLT'    ;; CHECK IF FIRST 3 BYTES ARE 'HLT' (0x5448 in LITTLE ENDIAN)
+    JNE continue_loop     ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
+    MOV RDI, R9           ;; BUFFER POINTER
+    CALL handle_hlt
+
+
+continue_loop:
     ;; ------------------------
     ;; WRITE(1, BUFFER, RAX)
     ;; ------------------------
     MOV RDI, 1               ;; STDOUT
-    MOV RDX, RAX             ;; BYTES TO WRITE (RETURNED BY READ)
+    MOV RSI, R9              ;; BUFFER
+    MOV RDX, R8              ;; BYTES TO WRITE (RETURNED BY READ)
     MOV RAX, 1               ;; SYS_WRITE
     SYSCALL
 
     JMP read_loop
+
+handle_hlt:
+    MOV RAX, 1               ;; SYS_WRITE
+    MOV RDI, 1               ;; STDOUT
+    MOV RDX, 3               ;; BYTES TO WRITE ('HLT')
+    ADD R9, 3                ;; ADVANCE BUFFER POINTER PAST 'HLT'
+    SUB R8, 3                ;; DECREASE BYTES TO WRITE BY 3
+    
+    SYSCALL
+    RET
 
 done:
     ;; ------------------------
