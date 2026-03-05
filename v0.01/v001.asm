@@ -33,34 +33,45 @@ read_loop:
     MOV RDX, 1024            ;; BYTES TO READ
     SYSCALL
 
-    CMP RAX, 0               ;; EOF?
+    MOV R8, RAX              ;; R8 = BYTES READ
+    LEA R9, [rel buffer]     ;; R9 = BUFFER START
+
+    CMP R8, 0                ;; EOF?
     JE done                  ;; IF ZERO, WE'RE DONE
 
-    MOV R8, RAX           ;; R8 = BYTES READ
-    LEA R9, [rel buffer]  ;; R9 = BUFFER START
+scan_loop:
+    CMP R8, 3               ;; CHECK IF WE HAVE AT LEAST 3 BYTES TO PROCESS
+    JL write_char           ;; IF LESS THAN 3 BYTES, WRITE THEM AS NORMAL
 
-    MOV RCX, [rel buffer] ;; READ FIRST 8 BYTES INTO RCX FOR COMPARISON
-    CMP WORD CX, 'HLT'    ;; CHECK IF FIRST 3 BYTES ARE 'HLT' (0x5448 in LITTLE ENDIAN)
-    JNE continue_loop     ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
+    CMP WORD [R9], 'HL'     ;; CHECK IF FIRST 3 BYTES ARE 'HLT' (0x5448 in LITTLE ENDIAN)
+    JNE write_char     ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
+    CMP BYTE [R9+2], 'T'  ;; CHECK THIRD BYTE IS 'T'
+    JNE write_char     ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
     MOV RDI, R9           ;; BUFFER POINTER
     CALL handle_hlt
 
-
-continue_loop:
+write_char:
     ;; ------------------------
     ;; WRITE(1, BUFFER, RAX)
     ;; ------------------------
-    MOV RDI, 1               ;; STDOUT
-    MOV RSI, R9              ;; BUFFER
-    MOV RDX, R8              ;; BYTES TO WRITE (RETURNED BY READ)
-    MOV RAX, 1               ;; SYS_WRITE
+    MOV RAX, 1                ;; SYS_WRITE
+    MOV RDI, 1                ;; STDOUT
+    MOV RSI, R9               ;; BUFFER
+    MOV RDX, 1                ;; BYTES TO WRITE
     SYSCALL
+
+    INC R9
+    DEC R8
+
+    CMP R8, 0
+    JG scan_loop
 
     JMP read_loop
 
 handle_hlt:
     MOV RAX, 1               ;; SYS_WRITE
     MOV RDI, 1               ;; STDOUT
+    MOV RSI, R9              ;; BUFFER
     MOV RDX, 3               ;; BYTES TO WRITE ('HLT')
     ADD R9, 3                ;; ADVANCE BUFFER POINTER PAST 'HLT'
     SUB R8, 3                ;; DECREASE BYTES TO WRITE BY 3
