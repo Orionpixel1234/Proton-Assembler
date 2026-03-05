@@ -1,3 +1,4 @@
 HLT
 TEST
 HLT
+NOP

@@ -2,6 +2,10 @@ DEFAULT REL
 
 SECTION .data
 filename DB "test.asm",0
+o_filename DB "test.bin",0
+hlt_msg DB 0xF4
+null_msg DB 0x00
+nop_msg DB 0x90
 
 SECTION .bss
 buffer RESB 1024
@@ -10,6 +14,18 @@ SECTION .text
 GLOBAL _start
 
 _start:
+    ;; ------------------------
+    ;; OPEN(OUTPUT FILE, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+    ;; ------------------------
+    MOV RAX, 2                  ;; SYS_OPEN
+    LEA RDI, [rel o_filename]   ;; FILENAME
+    MOV RSI, 557                ;; O_WRONLY | O_CREAT | O_TRUNC = 0x241
+    MOV RDX, 0644               ;; FILE MODE (rw-r--r--)
+    SYSCALL
+    MOV R13, RAX                ;; FILE DESCRIPTOR FOR OUTPUT FILE
+    CMP R13, 0
+    JS exit_error
+
     ;; ------------------------
     ;; OPEN(FILENAME, O_RDONLY)
     ;; ------------------------
@@ -44,22 +60,33 @@ scan_loop:
     JL write_char           ;; IF LESS THAN 3 BYTES, WRITE THEM AS NORMAL
 
     CMP WORD [R9], 'HL'     ;; CHECK IF FIRST 3 BYTES ARE 'HLT' (0x5448 in LITTLE ENDIAN)
-    JNE write_char     ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
-    CMP BYTE [R9+2], 'T'  ;; CHECK THIRD BYTE IS 'T'
-    JNE write_char     ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
-    MOV RDI, R9           ;; BUFFER POINTER
+    JNE c1                  ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
+    CMP BYTE [R9+2], 'T'    ;; CHECK THIRD BYTE IS 'T'
+    JNE c1                  ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
+    MOV RDI, R9             ;; BUFFER POINTER
     CALL handle_hlt
+
+c1:
+    CMP WORD [R9], 'NO'     ;; CHECK IF FIRST 2 BYTES ARE 'NO' (0x4F4E in LITTLE ENDIAN)
+    JNE write_char          ;; IF NOT 'NO', WRITE AS NORMAL
+    CMP BYTE [R9+2], 'P'    ;; CHECK THIRD BYTE IS 'P'
+    JNE write_char          ;; IF NOT 'NOP', WRITE AS NORMAL
+    MOV RDI, R9             ;; BUFFER POINTER
+    CALL handle_nop
 
 write_char:
     ;; ------------------------
-    ;; WRITE(1, BUFFER, RAX)
+    ;; WRITE(FILE, BUFFER, RAX)
     ;; ------------------------
+    CMP BYTE [R9], 0x0A
+    JE skip
     MOV RAX, 1                ;; SYS_WRITE
-    MOV RDI, 1                ;; STDOUT
-    MOV RSI, R9               ;; BUFFER
+    MOV RDI, R13              ;; OUTPUT FILE
+    MOV RSI, null_msg         ;; BUFFER
     MOV RDX, 1                ;; BYTES TO WRITE
     SYSCALL
 
+skip:
     INC R9
     DEC R8
 
@@ -69,14 +96,31 @@ write_char:
     JMP read_loop
 
 handle_hlt:
+    CMP BYTE [R9], 0x0A
+    JE skip
     MOV RAX, 1               ;; SYS_WRITE
-    MOV RDI, 1               ;; STDOUT
-    MOV RSI, R9              ;; BUFFER
-    MOV RDX, 3               ;; BYTES TO WRITE ('HLT')
+    MOV RDI, R13             ;; OUTPUT FILE
+    LEA RSI, [hlt_msg]       ;; BUFFER
+    MOV RDX, 1               ;; BYTES TO WRITE ('HLT')
+    SYSCALL
+    CALL skip_3
+    RET
+
+handle_nop:
+    CMP BYTE [R9], 0x0A
+    JE skip
+    MOV RAX, 1               ;; SYS_WRITE
+    MOV RDI, R13             ;; OUTPUT FILE
+    LEA RSI, [nop_msg]       ;; BUFFER (WRITE NULL BYTE FOR 'NOP')
+    MOV RDX, 1               ;; BYTES TO WRITE
+    SYSCALL
+    CALL skip_3
+    RET
+
+skip_3:
     ADD R9, 3                ;; ADVANCE BUFFER POINTER PAST 'HLT'
     SUB R8, 3                ;; DECREASE BYTES TO WRITE BY 3
     
-    SYSCALL
     RET
 
 done:
@@ -85,6 +129,10 @@ done:
     ;; ------------------------
     MOV RAX, 3               ;; SYS_CLOSE
     MOV RDI, R12             ;; FD
+    SYSCALL
+
+    MOV RAX, 3               ;; SYS_CLOSE
+    MOV RDI, R13             ;; FD
     SYSCALL
 
     ;; ------------------------
