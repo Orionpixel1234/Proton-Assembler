@@ -1,22 +1,38 @@
 DEFAULT REL
 
 SECTION .data
-filename DB "test.asm",0
-o_filename DB "test.bin",0
-hlt_msg DB 0xF4
-null_msg DB 0x00
-nop_msg DB 0x90
+filename    DB "test.asm", 0
+o_filename  DB "test.bin", 0
+rex_w       DB 0x48
+mov_opcode  DB 0xB8
+rax_opcode  DB 0x00
+rcx_opcode  DB 0x01
 
 SECTION .bss
-buffer RESB 1024
+buffer  resb 1024
+opcode  resb 1
+value   resq 1
+digit   resb 1
 
 SECTION .text
 GLOBAL _start
 
 _start:
-    ;; ------------------------
-    ;; OPEN(OUTPUT FILE, O_WRONLY|O_CREAT|O_TRUNC, 0644)
-    ;; ------------------------
+    ;; --------------------------------
+    ;; OPEN(RAX = 2, RDI = filename, RSI = flags, RDX = mode)
+
+    MOV RAX, 2                ;; SYS_OPEN
+    LEA RDI, [rel filename]   ;; FILE TO OPEN (RIP-relative)
+    XOR RSI, RSI              ;; FLAGS = O_RDONLY (0)
+    XOR RDX, RDX              ;; MODE = (not used)
+    SYSCALL
+    MOV R12, RAX
+    CMP R12, 0
+    JS exit_error
+    ;; --------------------------------
+
+    ;; --------------------------------
+    ;; OPEN(RAX = 0, RDI = filename, RSI = flags, RDX = mode)
     MOV RAX, 2                  ;; SYS_OPEN
     LEA RDI, [rel o_filename]   ;; FILENAME
     MOV RSI, 557                ;; O_WRONLY | O_CREAT | O_TRUNC = 0x241
@@ -25,124 +41,187 @@ _start:
     MOV R13, RAX                ;; FILE DESCRIPTOR FOR OUTPUT FILE
     CMP R13, 0
     JS exit_error
-
-    ;; ------------------------
-    ;; OPEN(FILENAME, O_RDONLY)
-    ;; ------------------------
-    MOV RAX, 2                ;; SYS_OPEN
-    LEA RDI, [rel filename]   ;; FILE TO OPEN (RIP-relative)
-    XOR RSI, RSI              ;; FLAGS = O_RDONLY (0)
-    XOR RDX, RDX              ;; MODE = (not used)
-    SYSCALL
-    MOV R12, RAX              ;; FILE DESCRIPTOR
-
-    CMP R12, 0                ;; CHECK IF FILE OPENED
-    JS exit_error             ;; NEGATIVE = ERROR
-
+    ;; --------------------------------
 read_loop:
-    ;; ------------------------
-    ;; READ(FD, BUFFER, 1024)
-    ;; ------------------------
-    MOV RAX, 0               ;; SYS_READ
-    MOV RDI, R12             ;; FILE DESCRIPTOR
-    LEA RSI, [rel buffer]    ;; BUFFER (RIP-relative)
-    MOV RDX, 1024            ;; BYTES TO READ
+    ;; --------------------------------
+    ;; READ(RAX = 0, RDI = fd, RSI = buffer, RDX = count)
+    MOV RAX, 0 ;; SYS_READ
+    MOV RDI, R12 ;; FD
+    LEA RSI, [rel buffer]
+    MOV RDX, 1024 ;; COUNT
     SYSCALL
 
-    MOV R8, RAX              ;; R8 = BYTES READ
-    LEA R9, [rel buffer]     ;; R9 = BUFFER START
+    TEST RAX, RAX
+    JZ exit
+    JS exit_error
 
-    CMP R8, 0                ;; EOF?
-    JE done                  ;; IF ZERO, WE'RE DONE
-
+    MOV R14, RAX ;; BYTES READ
+    LEA R15, [rel buffer] ;; BUFFER POINTER
+    ;; --------------------------------
 scan_loop:
-    CMP R8, 3               ;; CHECK IF WE HAVE AT LEAST 3 BYTES TO PROCESS
-    JL write_char           ;; IF LESS THAN 3 BYTES, WRITE THEM AS NORMAL
+    CMP R14, 12             ;; Need at least 12 bytes for MOV R?, 0xIMM64
+    JL read_loop
 
-    CMP WORD [R9], 'HL'     ;; CHECK IF FIRST 3 BYTES ARE 'HLT' (0x5448 in LITTLE ENDIAN)
-    JNE c1                  ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
-    CMP BYTE [R9+2], 'T'    ;; CHECK THIRD BYTE IS 'T'
-    JNE c1                  ;; IF NOT 'HLT', CONTINUE NORMAL WRITE LOOP
-    MOV RDI, R9             ;; BUFFER POINTER
-    CALL handle_hlt
-
-c1:
-    CMP WORD [R9], 'NO'     ;; CHECK IF FIRST 2 BYTES ARE 'NO' (0x4F4E in LITTLE ENDIAN)
-    JNE write_char          ;; IF NOT 'NO', WRITE AS NORMAL
-    CMP BYTE [R9+2], 'P'    ;; CHECK THIRD BYTE IS 'P'
-    JNE write_char          ;; IF NOT 'NOP', WRITE AS NORMAL
-    MOV RDI, R9             ;; BUFFER POINTER
-    CALL handle_nop
-
-write_char:
-    ;; ------------------------
-    ;; WRITE(FILE, BUFFER, RAX)
-    ;; ------------------------
-    CMP BYTE [R9], 0x0A
-    JE skip
-    MOV RAX, 1                ;; SYS_WRITE
-    MOV RDI, R13              ;; OUTPUT FILE
-    MOV RSI, null_msg         ;; BUFFER
-    MOV RDX, 1                ;; BYTES TO WRITE
-    SYSCALL
+    CMP BYTE [R15], 'M'
+    JNE skip
+    CMP BYTE [R15+1], 'O'
+    JNE skip
+    CMP BYTE [R15+2], 'V'
+    JNE skip
+    CALL handle_mov
+    JMP scan_loop
 
 skip:
-    INC R9
-    DEC R8
-
-    CMP R8, 0
-    JG scan_loop
-
+    INC R15
+    DEC R14
+    CMP R14, 12
+    JGE scan_loop
     JMP read_loop
 
-handle_hlt:
-    CMP BYTE [R9], 0x0A
-    JE skip
-    MOV RAX, 1               ;; SYS_WRITE
-    MOV RDI, R13             ;; OUTPUT FILE
-    LEA RSI, [hlt_msg]       ;; BUFFER
-    MOV RDX, 1               ;; BYTES TO WRITE ('HLT')
+exit:
+    ;; --------------------------------
+    ;; CLOSE(RAX = 3, RDI = fd)
+    MOV RAX, 3 ;; SYS_CLOSE
+    MOV RDI, R12 ;; FD
     SYSCALL
-    CALL skip_3
-    RET
+    ;; --------------------------------
 
-handle_nop:
-    CMP BYTE [R9], 0x0A
-    JE skip
-    MOV RAX, 1               ;; SYS_WRITE
-    MOV RDI, R13             ;; OUTPUT FILE
-    LEA RSI, [nop_msg]       ;; BUFFER (WRITE NULL BYTE FOR 'NOP')
-    MOV RDX, 1               ;; BYTES TO WRITE
+    ;; --------------------------------
+    ;; CLOSE(RAX = 3, RDI = fd)
+    MOV RAX, 3 ;; SYS_CLOSE
+    MOV RDI, R13 ;; FD
     SYSCALL
-    CALL skip_3
-    RET
+    ;; --------------------------------
 
-skip_3:
-    ADD R9, 3                ;; ADVANCE BUFFER POINTER PAST 'HLT'
-    SUB R8, 3                ;; DECREASE BYTES TO WRITE BY 3
-    
-    RET
-
-done:
-    ;; ------------------------
-    ;; CLOSE(FD)
-    ;; ------------------------
-    MOV RAX, 3               ;; SYS_CLOSE
-    MOV RDI, R12             ;; FD
+    ;; --------------------------------
+    ;; EXIT(RAX = 60, RDI = status)
+    MOV RAX, 60 ;; SYS_EXIT
+    XOR RDI, RDI ;; STATUS = 0
     SYSCALL
-
-    MOV RAX, 3               ;; SYS_CLOSE
-    MOV RDI, R13             ;; FD
-    SYSCALL
-
-    ;; ------------------------
-    ;; EXIT(CODE)
-    ;; ------------------------
-    MOV RAX, 60              ;; SYS_EXIT
-    XOR RDI, RDI             ;; EXIT CODE 0
-    SYSCALL
-
+    ;; --------------------------------
+ 
 exit_error:
-    MOV RAX, 60              ;; SYS_EXIT
-    MOV RDI, 1               ;; EXIT CODE 1 (ERROR)
+    ;; --------------------------------
+    ;; EXIT(RAX = 60, RDI = status)
+    MOV RAX, 60 ;; SYS_EXIT
+    MOV RDI, 1 ;; STATUS = 0
     SYSCALL
+    ;; --------------------------------
+
+handle_mov:
+    CALL write_rex_w
+    MOV  AL, [rel mov_opcode]
+    MOV [rel opcode], AL
+    ADD R15, 4 ;; SKIP "MOV " IN INSTRUCTION
+    SUB R14, 4 ;; ADJUST BYTES LEFT
+    CALL handle_reg
+    ADD R15, 2 ;; SKIP COMMA AND SPACE
+    SUB R14, 2 ;; ADJUST BYTES LEFT
+    CALL handle_hex
+    CALL write_imm64
+    RET
+.done:
+    RET
+
+write_rex_w:
+    ;; --------------------------------
+    ;; WRITE(RAX = 1, RDI = fd, RSI = buffer, RDX = count)
+    MOV RAX, 1 ;; SYS_WRITE
+    MOV RDI, R13 ;; FD
+    LEA RSI, [rel rex_w] ;; ADDRESS OF REX.W IN BUFFER
+    MOV RDX, 1 ;; BYTES TO WRITE
+    SYSCALL
+    RET
+
+
+    ;; --------------------------------
+handle_hex:
+    MOV QWORD [value], 0
+
+.hex_loop:
+    CMP R14, 0
+    JE .done
+    MOV AL, [R15]
+    CMP AL, ' '
+    JE .advance
+    CMP AL, 0x0A
+    JE .done
+    JMP .convert
+
+.advance:
+    INC R15
+    DEC R14
+    JMP .hex_loop
+
+.convert:
+    CALL .hex_to_val
+    MOVZX RAX, AL
+    SHL QWORD [value], 4
+    OR QWORD [value], RAX
+    INC R15
+    DEC R14
+    JMP .hex_loop
+
+.hex_to_val:
+    CMP AL, '0'
+    JB .invalid
+    CMP AL, '9'
+    JBE .num
+    CMP AL, 'A'
+    JB .invalid
+    CMP AL, 'F'
+    JBE .upper
+.invalid:
+    XOR EAX, EAX
+    RET
+.num:
+    SUB AL, '0'
+    RET
+.upper:
+    SUB AL, 'A'
+    ADD AL, 10
+    RET
+
+.done:
+    MOV RAX, [rel value]
+    RET
+
+handle_reg:
+    MOV AL, [rel opcode]
+    CMP BYTE [R15], 'R'
+    JNE .done
+    CMP BYTE [R15+1], 'A'
+    JE .reg_rax
+    CMP BYTE [R15+1], 'C'
+    JE .reg_rcx
+    JMP .done
+
+.reg_rax:
+    ADD AL, [rel rax_opcode]
+    JMP .done
+
+.reg_rcx:
+    ADD AL, [rel rcx_opcode]
+
+.done:
+    MOV [rel opcode], AL
+    CALL write_opcode
+    ADD R15, 3
+    SUB R14, 3
+    RET
+
+write_opcode:
+    MOV RAX, 1 ;; SYS_WRITE
+    MOV RDI, R13 ;; FD
+    LEA RSI, [rel opcode] ;; ADDRESS OF OPCODE IN BUFFER
+    MOV RDX, 1 ;; BYTES TO WRITE
+    SYSCALL
+    RET
+
+write_imm64:
+    MOV RAX, 1
+    MOV RDI, R13
+    LEA RSI, [rel value]
+    MOV RDX, 8
+    SYSCALL
+    RET
