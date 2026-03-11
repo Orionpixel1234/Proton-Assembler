@@ -6,6 +6,9 @@ o_filename       DB "test.bin", 0
 rex_w            DB 0x48
 syscall_opcode   DB 0x0F, 0x05
 mov_opcode       DB 0xB8
+mov_reg_opcode   DB 0x89
+push_opcode      DB 0x50
+pop_opcode       DB 0x58
 rax_opcode       DB 0x00
 rcx_opcode       DB 0x01
 rdx_opcode       DB 0x02
@@ -15,11 +18,43 @@ rbp_opcode       DB 0x05
 rsi_opcode       DB 0x06
 rdi_opcode       DB 0x07
 
+ELF_HEADER:
+    db 0x7F,"ELF"
+    db 2
+    db 1
+    db 1
+    times 9 db 0
+    dw 2
+    dw 0x3E
+    dd 1
+    dq 0x400078
+    dq 64
+    dq 0
+    dd 0
+    dw 64
+    dw 56
+    dw 1
+    dw 0
+    dw 0
+
+PROGRAM_HEADER:
+    dd 1
+    dd 5
+    dq 0
+    dq 0x400000
+    dq 0x400000
+    dq 0x1000
+    dq 0x1000
+    dq 0x1000
+    
 SECTION .bss
 buffer  resb 1024
 opcode  resb 1
 value   resq 1
 digit   resb 1
+modrm   resb 1
+src_reg resb 1
+dst_reg resb 1
 
 SECTION .text
 GLOBAL _start
@@ -49,6 +84,7 @@ _start:
     CMP R13, 0
     JS exit_error
     ;; --------------------------------
+    CALL write_elf_header
 read_loop:
     ;; --------------------------------
     ;; READ(RAX = 0, RDI = fd, RSI = buffer, RDX = count)
@@ -93,23 +129,82 @@ check_syscall:
 
 check_mov:
     CMP R14, 3
-    JL skip
+    JL check_push
 
     CMP BYTE [R15], 'M'
+    JNE check_push
+    CMP BYTE [R15+1], 'O'
+    JNE check_push
+    CMP BYTE [R15+2], 'V'
+    JNE check_push
+
+    JMP check_mov_reg
+
+check_mov_reg:
+    CMP R14, 4
+    JL skip
+
+    CMP BYTE [R15+4], 'R'
+    JNE skip
+    CMP BYTE [R15+9], 'R'
+    JNE mov_non_reg
+
+    CALL handle_mov_reg
+    JMP scan_loop
+
+mov_non_reg:
+    CALL handle_mov
+    JMP scan_loop
+
+check_push:
+    CMP R14, 4
+    JL skip
+
+    CMP BYTE [R15], 'P'
+    JNE check_pop
+    CMP BYTE [R15+1], 'U'
+    JNE check_pop
+    CMP BYTE [R15+2], 'S'
+    JNE check_pop
+    CMP BYTE [R15+3], 'H'
+    JNE check_pop
+
+    CALL handle_push
+    JMP scan_loop
+
+check_pop:
+    CMP R14, 3
+    JL skip
+
+    CMP BYTE [R15], 'P'
+    JNE check_xor
+    CMP BYTE [R15+1], 'O'
+    JNE check_xor
+    CMP BYTE [R15+2], 'P'
+    JNE check_xor
+
+    CALL handle_pop
+    JMP scan_loop
+
+check_xor:
+    CMP R14, 3
+    JL skip
+
+    CMP BYTE [R15], 'X'
     JNE skip
     CMP BYTE [R15+1], 'O'
     JNE skip
-    CMP BYTE [R15+2], 'V'
+    CMP BYTE [R15+2], 'R'
     JNE skip
 
-    CALL handle_mov
+    CALL handle_xor
     JMP scan_loop
 
 skip:
     INC R15
     DEC R14
     JMP scan_loop
-    
+
 exit:
     ;; --------------------------------
     ;; CLOSE(RAX = 3, RDI = fd)
@@ -140,6 +235,56 @@ exit_error:
     SYSCALL
     ;; --------------------------------
 
+handle_xor:
+
+    ADD R15, 4
+    SUB R14, 4
+
+    CALL parse_reg
+    MOV [dst_reg], AL
+
+    ADD R15, 3
+    SUB R14, 3
+
+    ADD R15, 2
+    SUB R14, 2
+
+    CALL parse_reg
+    MOV [src_reg], AL
+
+    ADD R15, 3
+    SUB R14, 3
+
+    CALL write_rex_w
+
+    MOV BYTE [opcode], 0x31
+    CALL write_opcode
+
+    CALL encode_modrm
+    CALL write_modrm
+
+    RET
+
+handle_pop:
+    MOV AL, [rel pop_opcode]
+    MOV [rel opcode], AL
+    ADD R15, 4                    ;; SKIP "POP " IN INSTRUCTION
+    SUB R14, 4                    ;; ADJUST BYTES LEFT
+    CALL handle_reg
+    ADD R15, 3                    ;; SKIP REGISTER NAME
+    SUB R14, 3                    ;; ADJUST BYTES LEFT
+    RET
+
+handle_push:
+    MOV AL, [rel push_opcode]
+    MOV [rel opcode], AL
+    ADD R15, 5                    ;; SKIP "PUSH " IN INSTRUCTION
+    SUB R14, 5                    ;; ADJUST BYTES LEFT
+    CALL handle_reg
+    ADD R15, 3                    ;; SKIP REGISTER NAME
+    SUB R14, 3                    ;; ADJUST BYTES LEFT
+    RET
+
 handle_syscall:
     ;; --------------------------------
     ;; WRITE(RAX = 1, RDI = fd, RSI = buffer, RDX = count)
@@ -154,6 +299,34 @@ handle_syscall:
 
     RET
     ;; --------------------------------
+
+handle_mov_reg:
+    ADD R15, 4
+    SUB R14, 4
+    CALL parse_reg
+    MOV [rel dst_reg], AL
+
+    ADD R15, 3
+    SUB R14, 3
+
+    ADD R15, 2
+    SUB R14, 2
+
+    CALL parse_reg
+    MOV [rel src_reg], AL
+
+    ADD R15, 3
+    SUB R14, 3
+
+    CALL write_rex_w
+
+    MOV BYTE [rel opcode], 0x89
+    CALL write_opcode
+
+    CALL encode_modrm
+    CALL write_modrm
+
+    RET
 
 handle_mov:
     CALL write_rex_w
@@ -311,5 +484,84 @@ write_imm64:
     MOV RDI, R13
     LEA RSI, [rel value]
     MOV RDX, 8
+    SYSCALL
+    RET
+
+encode_modrm:
+    MOV AL, [rel src_reg]
+    SHL AL, 3
+    OR  AL, [rel dst_reg]
+    OR  AL, 0xC0
+    MOV [rel modrm], AL
+    RET
+
+write_modrm:
+    MOV RAX, 1
+    MOV RDI, R13
+    LEA RSI, [rel modrm]
+    MOV RDX, 1
+    SYSCALL
+    RET
+
+parse_reg:
+
+    CMP BYTE [R15+1], 'A'
+    JE .rax
+    CMP BYTE [R15+1], 'C'
+    JE .rcx
+    CMP BYTE [R15+1], 'D'
+    JE .rdx_rdi
+    CMP BYTE [R15+1], 'B'
+    JE .rbx_rbp
+    CMP BYTE [R15+1], 'S'
+    JE .rsp_rsi
+
+.rax:
+    MOV AL, 0
+    RET
+
+.rcx:
+    MOV AL, 1
+    RET
+
+.rdx_rdi:
+    CMP BYTE [R15+2], 'X'
+    JE .rdx
+    MOV AL, 7
+    RET
+.rdx:
+    MOV AL, 2
+    RET
+
+.rbx_rbp:
+    CMP BYTE [R15+2], 'X'
+    JE .rbx
+    MOV AL, 5
+    RET
+.rbx:
+    MOV AL, 3
+    RET
+
+.rsp_rsi:
+    CMP BYTE [R15+2], 'P'
+    JE .rsp
+    MOV AL, 6
+    RET
+.rsp:
+    MOV AL, 4
+    RET
+
+write_elf_header:
+    MOV RAX, 1
+    MOV RDI, R13
+    LEA RSI, [rel ELF_HEADER]
+    MOV RDX, 64
+    SYSCALL
+    JMP .write_program_header
+.write_program_header:
+    MOV RAX, 1
+    MOV RDI, R13
+    LEA RSI, [rel PROGRAM_HEADER]
+    MOV RDX, 56
     SYSCALL
     RET
