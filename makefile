@@ -17,5 +17,10 @@ $(BUILD):
 $(BIN): | $(BUILD)
 	mkdir -p $@
 
-all: $(V001) | $(BIN)
+run: $(V001) | $(BIN)
 	cd $(BIN) && ./v001
+
+include build/bin/makefile
+
+all: test
+
