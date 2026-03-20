@@ -1,0 +1,3 @@
+build/*/**
+!build/bin/makefile
+!build/bin/test.asm
