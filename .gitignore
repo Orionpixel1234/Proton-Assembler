@@ -1,3 +1,5 @@
-build/*/**
+build/**
+build/bin/**
+build/bin/v001.o
 !build/bin/makefile
 !build/bin/test.asm
