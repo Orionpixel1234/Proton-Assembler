@@ -1,5 +1,5 @@
 $(V001_O): $(V001_SRC) | $(BIN)
-	$(AS) $(ASFLAGS) $(V001_SRC) -o $(V001_O)
+	$(CC) $(CFLAGS) -c $< -o $@
 
-$(V001): $(V001_O) | $(BIN)
-	$(LD) $(V001_O) -o $(V001)
+$(V001): $(V001_O)
+	$(CC) $(CFLAGS) $< -o $@

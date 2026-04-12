@@ -1,5 +1,7 @@
 build/**
 build/bin/**
-build/bin/v001.o
+build/bin/*.o
 !build/bin/makefile
 !build/bin/test.asm
+
+.vscode/mcp.json

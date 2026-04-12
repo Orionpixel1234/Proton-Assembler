@@ -1,12 +1,15 @@
 BUILD := build
 BIN := $(BUILD)/bin
 
-AS := nasm
+CC := gcc
+CFLAGS := -m64 -fno-pie -no-pie
 LD := ld
+LDFLAGS := -m elf_x86_64 -Ttext 0x400000 --oformat elf64-x86-64
+AS := nasm
 ASFLAGS := -f elf64
 
-V001_SRC := v0.01/v001.asm
-V001_O := $(BIN)/v001.o
+V001_SRC := v0.01/v001.c
+V001_O := $(BUILD)/v001.o
 V001 := $(BIN)/v001
 
 include v0.01/makefile
@@ -18,9 +21,7 @@ $(BIN): | $(BUILD)
 	mkdir -p $@
 
 run: $(V001) | $(BIN)
-	cd $(BIN) && ./v001
+	cd $(BIN) && ./v001 -f bin test.asm -o test.bin
 
-include build/bin/makefile
-
-all: test
+all: run
 
