@@ -1,18 +1,30 @@
 BUILD := build
-BIN := $(BUILD)/bin
+BIN   := $(BUILD)/bin
 
-CC := gcc
+CC     := gcc
 CFLAGS := -m64 -fno-pie -no-pie
-LD := ld
-LDFLAGS := -m elf_x86_64 -Ttext 0x400000 --oformat elf64-x86-64
-AS := nasm
-ASFLAGS := -f elf64
 
-V001_SRC := v0.01/v001.c
-V001_O := $(BUILD)/v001.o
-V001 := $(BIN)/v001
+PROTON_SRC := proton.c
+PROTON_O   := $(BIN)/proton.o
+PROTON     := $(BUILD)/proton
 
-include v0.01/makefile
+# ── Proton assembler binary ───────────────────────────────────────────────────
+
+$(PROTON_O): $(PROTON_SRC) | $(BIN)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(PROTON): $(PROTON_O)
+	$(CC) $(CFLAGS) $< -o $@
+
+# ── Assembly targets ──────────────────────────────────────────────────────────
+
+$(BIN)/test.bin: $(BIN)/test.asm | $(PROTON)
+	cd $(BUILD) && ./proton -f bin bin/test.asm -o bin/test.bin
+
+$(BIN)/hello.bin: $(BIN)/hello.asm $(BIN)/print.asm | $(PROTON)
+	cd $(BUILD) && ./proton -f bin bin/hello.asm -o bin/hello.bin
+
+# ── Directory rules ───────────────────────────────────────────────────────────
 
 $(BUILD):
 	mkdir -p $@
@@ -20,8 +32,15 @@ $(BUILD):
 $(BIN): | $(BUILD)
 	mkdir -p $@
 
-run: $(V001) | $(BIN)
-	cd $(BIN) && ./v001 -f bin test.asm -o test.bin
+# ── Phony targets ─────────────────────────────────────────────────────────────
 
-all: run
+.PHONY: all test hello clean
 
+all: test hello
+
+test: $(BIN)/test.bin
+
+hello: $(BIN)/hello.bin
+
+clean:
+	rm -f $(PROTON_O) $(PROTON) $(BIN)/test.bin $(BIN)/hello.bin
