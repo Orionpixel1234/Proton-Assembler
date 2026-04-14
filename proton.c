@@ -58,6 +58,8 @@ static size_t gbn = 0;
 static void  E(uint8_t b)   { if (gpass==2) { if (gbn<MAX_CODE) gbuf[gbn]=b; gbn++; } gpc++; }
 static void E16(uint16_t v) { E(v & 0xFF); E(v >> 8); }
 static void E32(uint32_t v) { E16(v & 0xFFFF); E16(v >> 16); }
+/* Emit 0x66 operand-size prefix when operand width doesn't match current mode */
+static void ospfx(int op32) { if ((op32&&gbits==16)||(!op32&&gbits==32)) E(0x66); }
 
 /* ============================================================
  * Lexer
@@ -193,9 +195,11 @@ static long long xeval(Tok *ts, int s, int e) { ET=ts; EP=s; EL=e; return pexpr(
  * ============================================================ */
 static const char *R16[]={"AX","CX","DX","BX","SP","BP","SI","DI",0};
 static const char *R8[] ={"AL","CL","DL","BL","AH","CH","DH","BH",0};
+static const char *R32[]={"EAX","ECX","EDX","EBX","ESP","EBP","ESI","EDI",0};
 static const char *SREG[]={"ES","CS","SS","DS","FS","GS",0};
 static int r16 (const char *n){for(int i=0;R16[i]; i++)if(!strcmp(n,R16[i])) return i;return -1;}
 static int r8  (const char *n){for(int i=0;R8[i];  i++)if(!strcmp(n,R8[i]))  return i;return -1;}
+static int r32 (const char *n){for(int i=0;R32[i]; i++)if(!strcmp(n,R32[i])) return i;return -1;}
 static int sreg(const char *n){for(int i=0;SREG[i];i++)if(!strcmp(n,SREG[i]))return i;return -1;}
 
 /* ============================================================
@@ -291,16 +295,16 @@ static int enc(Tok *ts, int n) {
 
     /* ---- PUSH / POP ---- */
     if (!strcmp(mn,"PUSH")) {
-        int r = r16(ts[o1s].s);
-        if (r >= 0) { E(0x50+r); return 0; }
+        int r = r16(ts[o1s].s); if (r>=0) { ospfx(0); E(0x50+r); return 0; }
+            r = r32(ts[o1s].s); if (r>=0) { ospfx(1); E(0x50+r); return 0; }
         long long v = xeval(ts,o1s,o1e);
         if (v>=-128&&v<=127) { E(0x6A); E((uint8_t)(int8_t)v); }
         else                 { E(0x68); E16((uint16_t)v); }
         return 0;
     }
     if (!strcmp(mn,"POP")) {
-        int r = r16(ts[o1s].s);
-        if (r >= 0) { E(0x58+r); return 0; }
+        int r = r16(ts[o1s].s); if (r>=0) { ospfx(0); E(0x58+r); return 0; }
+            r = r32(ts[o1s].s); if (r>=0) { ospfx(1); E(0x58+r); return 0; }
         fprintf(stderr,"POP: bad operand\n"); return -1;
     }
 
@@ -315,10 +319,11 @@ static int enc(Tok *ts, int n) {
                 return 0;
             }
         }
-        /* Near JMP (always E9 rel16 = 3 bytes for consistent 2-pass sizing) */
+        /* Near JMP: rel16 in 16-bit mode, rel32 in 32-bit mode */
         long long tgt = xeval(ts,o1s,o1e);
         long long cur = (long long)(gorg+gpc);
-        E(0xE9); E16((uint16_t)(int16_t)(tgt-(cur+3)));
+        if (gbits==32) { E(0xE9); E32((uint32_t)(int32_t)(tgt-(cur+5))); }
+        else           { E(0xE9); E16((uint16_t)(int16_t)(tgt-(cur+3))); }
         return 0;
     }
 
@@ -326,7 +331,8 @@ static int enc(Tok *ts, int n) {
     if (!strcmp(mn,"CALL")) {
         long long tgt = xeval(ts,o1s,o1e);
         long long cur = (long long)(gorg+gpc);
-        E(0xE8); E16((uint16_t)(int16_t)(tgt-(cur+3)));
+        if (gbits==32) { E(0xE8); E32((uint32_t)(int32_t)(tgt-(cur+5))); }
+        else           { E(0xE8); E16((uint16_t)(int16_t)(tgt-(cur+3))); }
         return 0;
     }
 
@@ -365,8 +371,9 @@ static int enc(Tok *ts, int n) {
     /* ---- INC / DEC (single-operand: register or BYTE [mem]) ---- */
     if (!strcmp(mn,"INC")||!strcmp(mn,"DEC")) {
         int dc = !strcmp(mn,"DEC");
-        int r = r16(ts[o1s].s); if (r>=0) { E((dc?0x48:0x40)+r); return 0; }
-        r = r8(ts[o1s].s);      if (r>=0) { E(0xFE); E(0xC0|(dc?8:0)|r); return 0; }
+        int r = r16(ts[o1s].s); if (r>=0) { ospfx(0); E((dc?0x48:0x40)+r); return 0; }
+            r = r32(ts[o1s].s); if (r>=0) { ospfx(1); E((dc?0x48:0x40)+r); return 0; }
+            r = r8(ts[o1s].s);  if (r>=0) { E(0xFE); E(0xC0|(dc?8:0)|r); return 0; }
         /* BYTE [mem]: FE /0=INC /1=DEC, mod=00 rm=110 = direct addr */
         if (ts[o1s].t==TLB) {
             long long a = memop(ts,o1s,o1e);
@@ -378,42 +385,55 @@ static int enc(Tok *ts, int n) {
     /* ---- Two-operand instructions ---- */
     if (co < 0) { fprintf(stderr,"Error: '%s' missing operands\n",mn); return -1; }
 
-    int d16=r16(ts[o1s].s), d8=r8(ts[o1s].s), dsr=sreg(ts[o1s].s);
+    int d16=r16(ts[o1s].s), d8=r8(ts[o1s].s), d32=r32(ts[o1s].s), dsr=sreg(ts[o1s].s);
     int dm = (ts[o1s].t==TLB);
     long long da = dm ? memop(ts,o1s,o1e) : 0;
 
-    int s16=-1, s8=-1, ssr=-1; long long imm=0;
+    int s16=-1, s8=-1, s32=-1, ssr=-1; long long imm=0;
     int sm = (o2s>=0 && ts[o2s].t==TLB);
     long long sa = sm ? memop(ts,o2s,o2e) : 0;
     if (!sm && o2s>=0) {
-        s16=r16(ts[o2s].s); s8=r8(ts[o2s].s); ssr=sreg(ts[o2s].s);
-        if (s16<0 && s8<0 && ssr<0) imm=xeval(ts,o2s,o2e);
+        s16=r16(ts[o2s].s); s8=r8(ts[o2s].s); s32=r32(ts[o2s].s); ssr=sreg(ts[o2s].s);
+        if (s16<0 && s8<0 && s32<0 && ssr<0) imm=xeval(ts,o2s,o2e);
     }
 
     /* ---- MOV ---- */
     if (!strcmp(mn,"MOV")) {
-        /* r8, r8  */  if (d8>=0&&s8>=0)             { E(0x8A); E(0xC0|(d8<<3)|s8);  return 0; }
-        /* r8, imm */  if (d8>=0&&!sm&&s16<0&&s8<0)  { E(0xB0+d8); E((uint8_t)imm);  return 0; }
-        /* r16, r16 */ if (d16>=0&&s16>=0)            { E(0x89); E(0xC0|(s16<<3)|d16);return 0; }
-        /* r16, imm */ if (d16>=0&&!sm&&s16<0&&s8<0) { E(0xB8+d16); E16((uint16_t)imm);return 0; }
-        /* r16, [m] */ if (d16>=0&&sm) {
+        /* r8,  r8   */ if (d8>=0&&s8>=0)                      { E(0x8A); E(0xC0|(d8<<3)|s8); return 0; }
+        /* r8,  imm8 */ if (d8>=0&&!sm&&s8<0&&s16<0&&s32<0)    { E(0xB0+d8); E((uint8_t)imm); return 0; }
+        /* r16, r16  */ if (d16>=0&&s16>=0)                     { ospfx(0); E(0x89); E(0xC0|(s16<<3)|d16); return 0; }
+        /* r32, r32  */ if (d32>=0&&s32>=0)                     { ospfx(1); E(0x89); E(0xC0|(s32<<3)|d32); return 0; }
+        /* r16, imm  */ if (d16>=0&&!sm&&s8<0&&s16<0&&s32<0)   { ospfx(0); E(0xB8+d16); E16((uint16_t)imm); return 0; }
+        /* r32, imm  */ if (d32>=0&&!sm&&s8<0&&s16<0&&s32<0)   { ospfx(1); E(0xB8+d32); E32((uint32_t)imm); return 0; }
+        /* r16, [m]  */ if (d16>=0&&sm) {
+            ospfx(0);
             if (d16==0) { E(0xA1); E16((uint16_t)sa); return 0; }
             E(0x8B); E(0x06|(d16<<3)); E16((uint16_t)sa); return 0;
         }
-        /* r8,  [m] */ if (d8>=0&&sm) {
-            if (d8==0)  { E(0xA0); E16((uint16_t)sa); return 0; }
+        /* r32, [m]  */ if (d32>=0&&sm) {
+            ospfx(1); E(0x8B); E(0x06|(d32<<3)); E16((uint16_t)sa); return 0;
+        }
+        /* r8,  [m]  */ if (d8>=0&&sm) {
+            if (d8==0) { E(0xA0); E16((uint16_t)sa); return 0; }
             E(0x8A); E(0x06|(d8<<3)); E16((uint16_t)sa); return 0;
         }
-        /* [m], r16 */ if (dm&&s16>=0) {
+        /* [m], r32  */ if (dm&&s32>=0) {
+            ospfx(1); E(0x89); E(0x06|(s32<<3)); E16((uint16_t)da); return 0;
+        }
+        /* [m], r16  */ if (dm&&s16>=0) {
+            ospfx(0);
             if (s16==0) { E(0xA3); E16((uint16_t)da); return 0; }
             E(0x89); E(0x06|(s16<<3)); E16((uint16_t)da); return 0;
         }
-        /* [m], r8  */ if (dm&&s8>=0) {
-            if (s8==0)  { E(0xA2); E16((uint16_t)da); return 0; }
+        /* [m], r8   */ if (dm&&s8>=0) {
+            if (s8==0) { E(0xA2); E16((uint16_t)da); return 0; }
             E(0x88); E(0x06|(s8<<3)); E16((uint16_t)da); return 0;
         }
+        /* CR0, r32  */ if (!strcmp(ts[o1s].s,"CR0")&&s32>=0) { E(0x0F);E(0x22);E(0xC0|s32);return 0; }
         /* CR0, r16  */ if (!strcmp(ts[o1s].s,"CR0")&&s16>=0) { E(0x0F);E(0x22);E(0xC0|s16);return 0; }
+        /* r32, CR0  */ if (d32>=0&&o2s>=0&&!strcmp(ts[o2s].s,"CR0")) { E(0x0F);E(0x20);E(0xC0|d32);return 0; }
         /* r16, CR0  */ if (d16>=0&&o2s>=0&&!strcmp(ts[o2s].s,"CR0")) { E(0x0F);E(0x20);E(0xC0|d16);return 0; }
+        /* sreg, r32 */ if (dsr>=0&&s32>=0) { E(0x8E); E(0xC0|(dsr<<3)|s32); return 0; }
         /* sreg, r16 */ if (dsr>=0&&s16>=0) { E(0x8E); E(0xC0|(dsr<<3)|s16); return 0; }
         /* r16, sreg */ if (d16>=0&&ssr>=0) { E(0x8C); E(0xC0|(ssr<<3)|d16); return 0; }
         fprintf(stderr,"MOV: unsupported operand combination\n"); return -1;
@@ -422,16 +442,46 @@ static int enc(Tok *ts, int n) {
     /* ---- ALU: XOR AND OR ADD SUB CMP TEST ---- */
     for (int i=0; ALU[i].m; i++) if (!strcmp(mn,ALU[i].m)) {
         if (ALU[i].tst) {
-            if (d8>=0&&s8>=0)  { E(0x84); E(0xC0|(s8<<3)|d8);  return 0; }
-            if (d16>=0&&s16>=0){ E(0x85); E(0xC0|(s16<<3)|d16); return 0; }
+            /* r, r */
+            if (d8>=0&&s8>=0)   { E(0x84); E(0xC0|(s8<<3)|d8);   return 0; }
+            if (d16>=0&&s16>=0) { ospfx(0); E(0x85); E(0xC0|(s16<<3)|d16); return 0; }
+            if (d32>=0&&s32>=0) { ospfx(1); E(0x85); E(0xC0|(s32<<3)|d32); return 0; }
+            /* r8, imm8 — A8 for AL, F6 /0 for others */
+            if (d8>=0&&s8<0&&s16<0&&s32<0) {
+                if (d8==0) { E(0xA8); E((uint8_t)imm); }
+                else       { E(0xF6); E(0xC0|d8); E((uint8_t)imm); }
+                return 0;
+            }
+            /* r16, imm16 — A9 for AX, F7 /0 for others */
+            if (d16>=0&&s8<0&&s16<0&&s32<0) {
+                ospfx(0);
+                if (d16==0) { E(0xA9); E16((uint16_t)imm); }
+                else        { E(0xF7); E(0xC0|d16); E16((uint16_t)imm); }
+                return 0;
+            }
+            /* r32, imm32 — A9(+66) for EAX, F7 /0 for others */
+            if (d32>=0&&s8<0&&s16<0&&s32<0) {
+                ospfx(1);
+                if (d32==0) { E(0xA9); E32((uint32_t)imm); }
+                else        { E(0xF7); E(0xC0|d32); E32((uint32_t)imm); }
+                return 0;
+            }
             fprintf(stderr,"TEST: bad operands\n"); return -1;
         }
-        if (d8>=0&&s8>=0)  { E(ALU[i].rr8);  E(0xC0|(s8<<3)|d8);  return 0; }
-        if (d16>=0&&s16>=0){ E(ALU[i].rr16); E(0xC0|(s16<<3)|d16); return 0; }
-        if (d8>=0)  { E(0x80); E(0xC0|(ALU[i].grp<<3)|d8);  E((uint8_t)imm); return 0; }
+        if (d8>=0&&s8>=0)   { E(ALU[i].rr8);  E(0xC0|(s8<<3)|d8);  return 0; }
+        if (d16>=0&&s16>=0) { ospfx(0); E(ALU[i].rr16); E(0xC0|(s16<<3)|d16); return 0; }
+        if (d32>=0&&s32>=0) { ospfx(1); E(ALU[i].rr16); E(0xC0|(s32<<3)|d32); return 0; }
+        if (d8>=0)  { E(0x80); E(0xC0|(ALU[i].grp<<3)|d8); E((uint8_t)imm); return 0; }
         if (d16>=0) {
+            ospfx(0);
             if (imm>=-128&&imm<=127) { E(0x83); E(0xC0|(ALU[i].grp<<3)|d16); E((uint8_t)(int8_t)imm); }
             else                     { E(0x81); E(0xC0|(ALU[i].grp<<3)|d16); E16((uint16_t)imm); }
+            return 0;
+        }
+        if (d32>=0) {
+            ospfx(1);
+            if (imm>=-128&&imm<=127) { E(0x83); E(0xC0|(ALU[i].grp<<3)|d32); E((uint8_t)(int8_t)imm); }
+            else                     { E(0x81); E(0xC0|(ALU[i].grp<<3)|d32); E32((uint32_t)imm); }
             return 0;
         }
         fprintf(stderr,"%s: bad operands\n",mn); return -1;
@@ -439,17 +489,25 @@ static int enc(Tok *ts, int n) {
 
     /* ---- SHL SHR SAR ROL ROR ---- */
     for (int i=0; SH[i].m; i++) if (!strcmp(mn,SH[i].m)) {
-        int r=r16(ts[o1s].s), rb=r8(ts[o1s].s);
+        int r=r16(ts[o1s].s), rb=r8(ts[o1s].s), r3=r32(ts[o1s].s);
         int cl  = (o2s>=0 && !strcmp(ts[o2s].s,"CL"));
         int cnt = (int)(o2s>=0 ? xeval(ts,o2s,o2e) : 0);
         if (r>=0) {
-            if (cl)       { E(0xD3); E(0xC0|(SH[i].g<<3)|r); }
+            ospfx(0);
+            if (cl)        { E(0xD3); E(0xC0|(SH[i].g<<3)|r); }
             else if(cnt==1){ E(0xD1); E(0xC0|(SH[i].g<<3)|r); }
             else           { E(0xC1); E(0xC0|(SH[i].g<<3)|r); E((uint8_t)cnt); }
             return 0;
         }
+        if (r3>=0) {
+            ospfx(1);
+            if (cl)        { E(0xD3); E(0xC0|(SH[i].g<<3)|r3); }
+            else if(cnt==1){ E(0xD1); E(0xC0|(SH[i].g<<3)|r3); }
+            else           { E(0xC1); E(0xC0|(SH[i].g<<3)|r3); E((uint8_t)cnt); }
+            return 0;
+        }
         if (rb>=0) {
-            if (cl)       { E(0xD2); E(0xC0|(SH[i].g<<3)|rb); }
+            if (cl)        { E(0xD2); E(0xC0|(SH[i].g<<3)|rb); }
             else if(cnt==1){ E(0xD0); E(0xC0|(SH[i].g<<3)|rb); }
             else           { E(0xC0); E(0xC0|(SH[i].g<<3)|rb); E((uint8_t)cnt); }
             return 0;
@@ -457,9 +515,11 @@ static int enc(Tok *ts, int n) {
         fprintf(stderr,"%s: bad operand\n",mn); return -1;
     }
 
-    /* ---- MOVZX r16, r8 ---- */
+    /* ---- MOVZX ---- */
     if (!strcmp(mn,"MOVZX")) {
-        if (d16>=0&&s8>=0) { E(0x0F); E(0xB6); E(0xC0|(d16<<3)|s8); return 0; }
+        if (d16>=0&&s8>=0)  { ospfx(0); E(0x0F); E(0xB6); E(0xC0|(d16<<3)|s8);  return 0; }
+        if (d32>=0&&s8>=0)  { ospfx(1); E(0x0F); E(0xB6); E(0xC0|(d32<<3)|s8);  return 0; }
+        if (d32>=0&&s16>=0) { ospfx(1); E(0x0F); E(0xB7); E(0xC0|(d32<<3)|s16); return 0; }
         fprintf(stderr,"MOVZX: unsupported operand combination\n"); return -1;
     }
 
