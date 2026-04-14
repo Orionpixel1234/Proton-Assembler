@@ -18,11 +18,8 @@ $(PROTON): $(PROTON_O)
 
 # ── Assembly targets ──────────────────────────────────────────────────────────
 
-$(BIN)/test.bin: $(BIN)/test.asm | $(PROTON)
-	cd $(BUILD) && ./proton -f bin bin/test.asm -o bin/test.bin
-
-$(BIN)/hello.bin: $(BIN)/hello.asm $(BIN)/print.asm | $(PROTON)
-	cd $(BUILD) && ./proton -f bin bin/hello.asm -o bin/hello.bin
+$(BIN)/hello.bin: hello.asm print.asm | $(PROTON)
+	cd $(BUILD) && ./proton -f bin hello.asm -o hello.bin
 
 # ── Directory rules ───────────────────────────────────────────────────────────
 
