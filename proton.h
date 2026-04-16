@@ -12,6 +12,14 @@
 #define EXIT_FAILURE 1
 #endif
 
+/* Output format enumeration */
+typedef enum {
+    FMT_BIN,
+    FMT_ELF32,
+    FMT_ELF64
+} OutFmt;
+extern OutFmt gfmt;
+
 /* CLI globals — shared between proton.c functions */
 const char *allowedOptions[] = {"-h", "--help", "-o", "-f", "--file"};
 const char *outputFileFormat = NULL;

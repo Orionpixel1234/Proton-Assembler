@@ -11,6 +11,7 @@
 #include "proton.h"
 #include <stdint.h>
 #include <ctype.h>
+#include <elf.h>
 
 /* ============================================================
  * Limits
@@ -27,6 +28,8 @@
 typedef struct { char n[128]; long long v; int ok; } Sym;
 static Sym  SYM[MAX_SYM];
 static int  NSYM;
+OutFmt gfmt = FMT_BIN;
+static long long g_entry = -1;
 
 static Sym *sfind(const char *n) {
     for (int i = 0; i < NSYM; i++)
@@ -156,6 +159,40 @@ static int gln(Tok *ts) {
 }
 
 /* ============================================================
+ * ELF Symbol / Relocation Tables  (used by -f elf32 / -f elf64)
+ * ============================================================ */
+#define MAX_ELFSY 256
+#define MAX_ELFRL 512
+
+typedef struct {
+    char      name[128];
+    int       global;   /* marked GLOBAL */
+    int       def;      /* 1=defined here, 0=extern (SHN_UNDEF) */
+    int       secidx;   /* 1-based ELF section index */
+    long long val;
+} ElfSym;
+
+typedef struct {
+    uint64_t off;      /* byte offset of fixup within .text */
+    char     sym[128]; /* target symbol name */
+    int      pcrel;    /* 1=PC-relative (R_*_PC32), 0=absolute (R_*_32) */
+} ElfRel;
+
+static ElfSym ELFSY[MAX_ELFSY]; static int NELFSY;
+static ElfRel ELFRL[MAX_ELFRL]; static int NELFRL;
+
+/* Set by pprim() when it evaluates an undefined symbol during pass 2 */
+static const char *glast_undef;
+
+static ElfSym *elfsym_get(const char *n) {
+    for (int i=0; i<NELFSY; i++) if (!strcmp(ELFSY[i].name,n)) return &ELFSY[i];
+    if (NELFSY>=MAX_ELFSY) { fputs("ELF symbol table full\n",stderr); exit(1); }
+    ElfSym *e = &ELFSY[NELFSY++];
+    strncpy(e->name,n,127); e->global=0; e->def=0; e->secidx=1; e->val=0;
+    return e;
+}
+
+/* ============================================================
  * Expression Evaluator  (recursive descent)
  * ============================================================ */
 static Tok *ET; static int EP, EL;
@@ -169,7 +206,10 @@ static long long pprim(void) {
     if (t->t==TN)   { EP++; return t->n; }
     if (t->t==TLP)  { EP++; long long v=pexpr(); if (EP<EL&&ET[EP].t==TRP) EP++; return v; }
     if (t->t==TMNS) { EP++; return -pprim(); }
-    if (t->t==TW)   { EP++; Sym *s=sfind(t->s); return (s&&s->ok)?s->v:0; }
+    if (t->t==TW)   { EP++; Sym *s=sfind(t->s);
+        if ((!s||!s->ok) && gpass==2 && (gfmt==FMT_ELF32||gfmt==FMT_ELF64))
+            glast_undef = t->s;
+        return (s&&s->ok)?s->v:0; }
     EP++; return 0;
 }
 static long long pterm(void) {
@@ -197,10 +237,10 @@ static const char *R16[]={"AX","CX","DX","BX","SP","BP","SI","DI",0};
 static const char *R8[] ={"AL","CL","DL","BL","AH","CH","DH","BH",0};
 static const char *R32[]={"EAX","ECX","EDX","EBX","ESP","EBP","ESI","EDI",0};
 static const char *SREG[]={"ES","CS","SS","DS","FS","GS",0};
-static int r16 (const char *n){for(int i=0;R16[i]; i++)if(!strcmp(n,R16[i])) return i;return -1;}
-static int r8  (const char *n){for(int i=0;R8[i];  i++)if(!strcmp(n,R8[i]))  return i;return -1;}
-static int r32 (const char *n){for(int i=0;R32[i]; i++)if(!strcmp(n,R32[i])) return i;return -1;}
-static int sreg(const char *n){for(int i=0;SREG[i];i++)if(!strcmp(n,SREG[i]))return i;return -1;}
+static int r16 (const char *n){for(int i=0;R16[i]; i++)if(!strcasecmp(n,R16[i])) return i;return -1;}
+static int r8  (const char *n){for(int i=0;R8[i];  i++)if(!strcasecmp(n,R8[i]))  return i;return -1;}
+static int r32 (const char *n){for(int i=0;R32[i]; i++)if(!strcasecmp(n,R32[i])) return i;return -1;}
+static int sreg(const char *n){for(int i=0;SREG[i];i++)if(!strcasecmp(n,SREG[i]))return i;return -1;}
 
 /* ============================================================
  * Instruction Encoder — 16-bit x86
@@ -260,18 +300,22 @@ static long long memop(Tok *ts, int s, int e) {
 
 static int enc(Tok *ts, int n) {
     if (!n || ts[0].t!=TW) return 0;
-    const char *mn = ts[0].s;
+    /* uppercase mnemonic for case-insensitive matching */
+    char mn_buf[32]; int _mi;
+    for (_mi=0; _mi<31 && ts[0].s[_mi]; _mi++) mn_buf[_mi]=(char)toupper((uint8_t)ts[0].s[_mi]);
+    mn_buf[_mi]=0;
+    const char *mn = mn_buf;
     int end = n-1, co = findcm(ts, n);
     int o1s=1, o1e=(co>=0)?co:end;
     int o2s=(co>=0)?co+1:-1, o2e=(co>=0)?end:-1;
 
     /* Strip BYTE/WORD/DWORD/QWORD size specifiers from operands */
     if (o1s<o1e && ts[o1s].t==TW &&
-        (!strcmp(ts[o1s].s,"BYTE")||!strcmp(ts[o1s].s,"WORD")||
-         !strcmp(ts[o1s].s,"DWORD")||!strcmp(ts[o1s].s,"QWORD"))) o1s++;
+        (!strcasecmp(ts[o1s].s,"BYTE")||!strcasecmp(ts[o1s].s,"WORD")||
+         !strcasecmp(ts[o1s].s,"DWORD")||!strcasecmp(ts[o1s].s,"QWORD"))) o1s++;
     if (o2s>=0 && o2s<o2e && ts[o2s].t==TW &&
-        (!strcmp(ts[o2s].s,"BYTE")||!strcmp(ts[o2s].s,"WORD")||
-         !strcmp(ts[o2s].s,"DWORD")||!strcmp(ts[o2s].s,"QWORD"))) o2s++;
+        (!strcasecmp(ts[o2s].s,"BYTE")||!strcasecmp(ts[o2s].s,"WORD")||
+         !strcasecmp(ts[o2s].s,"DWORD")||!strcasecmp(ts[o2s].s,"QWORD"))) o2s++;
 
     /* ---- Zero-operand ---- */
     if (!strcmp(mn,"HLT"))  { E(0xF4); return 0; }
@@ -320,19 +364,47 @@ static int enc(Tok *ts, int n) {
             }
         }
         /* Near JMP: rel16 in 16-bit mode, rel32 in 32-bit mode */
+        glast_undef = NULL;
         long long tgt = xeval(ts,o1s,o1e);
         long long cur = (long long)(gorg+gpc);
-        if (gbits==32) { E(0xE9); E32((uint32_t)(int32_t)(tgt-(cur+5))); }
-        else           { E(0xE9); E16((uint16_t)(int16_t)(tgt-(cur+3))); }
+        if (gbits==32) {
+            E(0xE9);
+            if (glast_undef && gpass==2 && (gfmt==FMT_ELF32||gfmt==FMT_ELF64)) {
+                ElfSym *es=elfsym_get(glast_undef); es->global=1;
+                if (NELFRL<MAX_ELFRL) {
+                    ElfRel *rl=&ELFRL[NELFRL++];
+                    rl->off=(uint64_t)gbn; strncpy(rl->sym,glast_undef,127); rl->pcrel=1;
+                }
+                E32((uint32_t)(int32_t)-4);
+            } else {
+                E32((uint32_t)(int32_t)(tgt-(cur+5)));
+            }
+        } else {
+            E(0xE9); E16((uint16_t)(int16_t)(tgt-(cur+3)));
+        }
         return 0;
     }
 
     /* ---- CALL near ---- */
     if (!strcmp(mn,"CALL")) {
+        glast_undef = NULL;
         long long tgt = xeval(ts,o1s,o1e);
         long long cur = (long long)(gorg+gpc);
-        if (gbits==32) { E(0xE8); E32((uint32_t)(int32_t)(tgt-(cur+5))); }
-        else           { E(0xE8); E16((uint16_t)(int16_t)(tgt-(cur+3))); }
+        if (gbits==32) {
+            E(0xE8);
+            if (glast_undef && gpass==2 && (gfmt==FMT_ELF32||gfmt==FMT_ELF64)) {
+                ElfSym *es=elfsym_get(glast_undef); es->global=1;
+                if (NELFRL<MAX_ELFRL) {
+                    ElfRel *rl=&ELFRL[NELFRL++];
+                    rl->off=(uint64_t)gbn; strncpy(rl->sym,glast_undef,127); rl->pcrel=1;
+                }
+                E32((uint32_t)(int32_t)-4);
+            } else {
+                E32((uint32_t)(int32_t)(tgt-(cur+5)));
+            }
+        } else {
+            E(0xE8); E16((uint16_t)(int16_t)(tgt-(cur+3)));
+        }
         return 0;
     }
 
@@ -349,14 +421,14 @@ static int enc(Tok *ts, int n) {
 
     /* ---- IN / OUT ---- */
     if (!strcmp(mn,"IN")) {
-        int al = !strcmp(ts[o1s].s,"AL");
-        if (o2s>=0&&!strcmp(ts[o2s].s,"DX")) { E(al?0xEC:0xED); }
+        int al = !strcasecmp(ts[o1s].s,"AL");
+        if (o2s>=0&&!strcasecmp(ts[o2s].s,"DX")) { E(al?0xEC:0xED); }
         else { E(al?0xE4:0xE5); E((uint8_t)xeval(ts,o2s,o2e)); }
         return 0;
     }
     if (!strcmp(mn,"OUT")) {
-        int al = (o2s>=0&&!strcmp(ts[o2s].s,"AL"));
-        if (!strcmp(ts[o1s].s,"DX")) { E(al?0xEE:0xEF); }
+        int al = (o2s>=0&&!strcasecmp(ts[o2s].s,"AL"));
+        if (!strcasecmp(ts[o1s].s,"DX")) { E(al?0xEE:0xEF); }
         else { E(al?0xE6:0xE7); E((uint8_t)xeval(ts,o1s,o1e)); }
         return 0;
     }
@@ -429,10 +501,10 @@ static int enc(Tok *ts, int n) {
             if (s8==0) { E(0xA2); E16((uint16_t)da); return 0; }
             E(0x88); E(0x06|(s8<<3)); E16((uint16_t)da); return 0;
         }
-        /* CR0, r32  */ if (!strcmp(ts[o1s].s,"CR0")&&s32>=0) { E(0x0F);E(0x22);E(0xC0|s32);return 0; }
-        /* CR0, r16  */ if (!strcmp(ts[o1s].s,"CR0")&&s16>=0) { E(0x0F);E(0x22);E(0xC0|s16);return 0; }
-        /* r32, CR0  */ if (d32>=0&&o2s>=0&&!strcmp(ts[o2s].s,"CR0")) { E(0x0F);E(0x20);E(0xC0|d32);return 0; }
-        /* r16, CR0  */ if (d16>=0&&o2s>=0&&!strcmp(ts[o2s].s,"CR0")) { E(0x0F);E(0x20);E(0xC0|d16);return 0; }
+        /* CR0, r32  */ if (!strcasecmp(ts[o1s].s,"CR0")&&s32>=0) { E(0x0F);E(0x22);E(0xC0|s32);return 0; }
+        /* CR0, r16  */ if (!strcasecmp(ts[o1s].s,"CR0")&&s16>=0) { E(0x0F);E(0x22);E(0xC0|s16);return 0; }
+        /* r32, CR0  */ if (d32>=0&&o2s>=0&&!strcasecmp(ts[o2s].s,"CR0")) { E(0x0F);E(0x20);E(0xC0|d32);return 0; }
+        /* r16, CR0  */ if (d16>=0&&o2s>=0&&!strcasecmp(ts[o2s].s,"CR0")) { E(0x0F);E(0x20);E(0xC0|d16);return 0; }
         /* sreg, r32 */ if (dsr>=0&&s32>=0) { E(0x8E); E(0xC0|(dsr<<3)|s32); return 0; }
         /* sreg, r16 */ if (dsr>=0&&s16>=0) { E(0x8E); E(0xC0|(dsr<<3)|s16); return 0; }
         /* r16, sreg */ if (d16>=0&&ssr>=0) { E(0x8C); E(0xC0|(ssr<<3)|d16); return 0; }
@@ -490,7 +562,7 @@ static int enc(Tok *ts, int n) {
     /* ---- SHL SHR SAR ROL ROR ---- */
     for (int i=0; SH[i].m; i++) if (!strcmp(mn,SH[i].m)) {
         int r=r16(ts[o1s].s), rb=r8(ts[o1s].s), r3=r32(ts[o1s].s);
-        int cl  = (o2s>=0 && !strcmp(ts[o2s].s,"CL"));
+        int cl  = (o2s>=0 && !strcasecmp(ts[o2s].s,"CL"));
         int cnt = (int)(o2s>=0 ? xeval(ts,o2s,o2e) : 0);
         if (r>=0) {
             ospfx(0);
@@ -610,7 +682,7 @@ static int asmpass(const char *src) {
         if (n<=1) { line++; continue; }
 
         /* ---- EQU: name EQU expr  (no colon) ---- */
-        if (ts[0].t==TW && n>2 && ts[1].t==TW && !strcmp(ts[1].s,"EQU")) {
+        if (ts[0].t==TW && n>2 && ts[1].t==TW && !strcasecmp(ts[1].s,"EQU")) {
             sset(ts[0].s, xeval(ts,2,end));
             line++; continue;
         }
@@ -619,14 +691,28 @@ static int asmpass(const char *src) {
         int ti = 0;
         if (ts[0].t==TW && n>1 && ts[1].t==TCOL) {
             /* Standard:  name: [instruction] */
-            sset(ts[0].s, (long long)(gorg + gpc));
+            long long addr = (long long)(gorg + gpc);
+            sset(ts[0].s, addr);
+            if (gfmt==FMT_ELF32||gfmt==FMT_ELF64) {
+                ElfSym *e=elfsym_get(ts[0].s); e->def=1; e->secidx=1; e->val=(long long)gpc;
+            }
+            if (gpass == 1 && !strcmp(ts[0].s, "_start")) {
+                g_entry = addr;
+            }
             ti = 2;
         } else if (ts[0].t==TW && n>1 && ts[1].t==TW) {
             /* NASM allows label without colon before data: name DB/DW/DD/DQ/TIMES val */
             const char *nx = ts[1].s;
-            if (!strcmp(nx,"DB")||!strcmp(nx,"DW")||!strcmp(nx,"DD")||
-                !strcmp(nx,"DQ")||!strcmp(nx,"TIMES")) {
-                sset(ts[0].s, (long long)(gorg + gpc));
+            if (!strcasecmp(nx,"DB")||!strcasecmp(nx,"DW")||!strcasecmp(nx,"DD")||
+                !strcasecmp(nx,"DQ")||!strcasecmp(nx,"TIMES")) {
+                long long addr = (long long)(gorg + gpc);
+                sset(ts[0].s, addr);
+                if (gfmt==FMT_ELF32||gfmt==FMT_ELF64) {
+                    ElfSym *e=elfsym_get(ts[0].s); e->def=1; e->secidx=1; e->val=(long long)gpc;
+                }
+                if (gpass == 1 && !strcmp(ts[0].s, "_start")) {
+                    g_entry = addr;
+                }
                 ti = 1; /* process directive starting at ts[1] */
             }
         }
@@ -639,11 +725,11 @@ static int asmpass(const char *src) {
             int cl = 1; while (cl<rn && rt[cl].t!=TRB) cl++;
             if (rn>1 && rt[1].t==TW) {
                 const char *dn = rt[1].s;
-                if (!strcmp(dn,"ORG") || !strcmp(dn,"org"))
+                if (!strcasecmp(dn,"ORG"))
                     gorg = (size_t)xeval(rt,2,cl);
-                else if (!strcmp(dn,"BITS")||!strcmp(dn,"bits"))
+                else if (!strcasecmp(dn,"BITS"))
                     gbits = (int)xeval(rt,2,cl);
-                else if (!strcmp(dn,"INCLUDE")||!strcmp(dn,"include"))
+                else if (!strcasecmp(dn,"INCLUDE"))
                     ; /* already flattened by preprocessor */
                 else if (gpass==2)
                     fprintf(stderr,"Warning: unknown directive [%s] line %d\n",dn,line);
@@ -653,12 +739,22 @@ static int asmpass(const char *src) {
 
         /* ---- Plain directives ---- */
         if (rn>0 && rt[0].t==TW) {
-            const char *d = rt[0].s;
+            char d_buf[32]; int _di;
+            for (_di=0;_di<31&&rt[0].s[_di];_di++) d_buf[_di]=(char)toupper((uint8_t)rt[0].s[_di]);
+            d_buf[_di]=0;
+            const char *d = d_buf;
 
             /* SECTION — reset $$ */
             if (!strcmp(d,"SECTION")) { gsec=gpc; line++; continue; }
-            /* GLOBAL / EXTERN — ignored for flat binary */
-            if (!strcmp(d,"GLOBAL")||!strcmp(d,"EXTERN")) { line++; continue; }
+            /* GLOBAL / EXTERN */
+            if (!strcmp(d,"GLOBAL")) {
+                if (rn>1 && rt[1].t==TW) elfsym_get(rt[1].s)->global=1;
+                line++; continue;
+            }
+            if (!strcmp(d,"EXTERN")) {
+                if (rn>1 && rt[1].t==TW) { ElfSym *e=elfsym_get(rt[1].s); e->global=1; e->def=0; }
+                line++; continue;
+            }
 
             /* DB — bytes and strings */
             if (!strcmp(d,"DB")) {
@@ -716,7 +812,7 @@ static int asmpass(const char *src) {
                 int dp=-1;
                 for (int i=1; i<rn; i++)
                     if (rt[i].t==TW &&
-                        (!strcmp(rt[i].s,"DB")||!strcmp(rt[i].s,"DW")||!strcmp(rt[i].s,"DD")))
+                        (!strcasecmp(rt[i].s,"DB")||!strcasecmp(rt[i].s,"DW")||!strcasecmp(rt[i].s,"DD")))
                         { dp=i; break; }
                 if (dp<0) {
                     fprintf(stderr,"Error: TIMES missing DB/DW/DD (line %d)\n",line);
@@ -727,9 +823,9 @@ static int asmpass(const char *src) {
                 const char *dt = rt[dp].s;
                 long long val = xeval(rt,dp+1,rn-1);
                 for (long long j=0; j<cnt; j++) {
-                    if      (!strcmp(dt,"DB")) E((uint8_t)val);
-                    else if (!strcmp(dt,"DW")) E16((uint16_t)val);
-                    else                       E32((uint32_t)val);
+                    if      (!strcasecmp(dt,"DB")) E((uint8_t)val);
+                    else if (!strcasecmp(dt,"DW")) E16((uint16_t)val);
+                    else                           E32((uint32_t)val);
                 }
                 line++; continue;
             }
@@ -767,7 +863,12 @@ int handleOption(const char *opt, const char *val) {
         printf("  -h, --help   This help\n");
         exit(0);
     }
-    if (!strcmp(opt,"-f"))     { outputFileFormat = val; return 0; }
+    if (!strcmp(opt,"-f")) {
+        if (val&&!strcmp(val,"elf64"))      gfmt=FMT_ELF64;
+        else if (val&&!strcmp(val,"elf32")) gfmt=FMT_ELF32;
+        else                               gfmt=FMT_BIN;
+        outputFileFormat=val; return 0;
+    }
     if (!strcmp(opt,"-o"))     { outputFileName = val; outputFileDefined = 1; return 0; }
     if (!strcmp(opt,"--file")) { inputFileName = val; return 0; }
     fprintf(stderr,"Error: unknown option '%s'\n",opt); return 1;
@@ -790,6 +891,248 @@ int checkArgs(int argc, char *argv[]) {
 }
 
 /* ============================================================
+ * ELF Output Writers
+ * ============================================================ */
+
+/* Build ordered symbol index: locals first, then globals.
+   Returns total symbol count (excluding STN_UNDEF entry). */
+static int elfsym_order(int order[MAX_ELFSY], int *first_global_out) {
+    int nord = 0, i;
+    for (i=0; i<NELFSY; i++) if (!ELFSY[i].global) order[nord++]=i;
+    *first_global_out = nord + 1; /* +1 for STN_UNDEF */
+    for (i=0; i<NELFSY; i++) if ( ELFSY[i].global) order[nord++]=i;
+    return nord;
+}
+
+/* Returns symtab index (1-based) for relocation sym name, 0 if not found. */
+static int elfsym_idx(const char *name, const int *order, int nord) {
+    int i, j;
+    for (i=0; i<NELFSY; i++) if (!strcmp(ELFSY[i].name,name)) {
+        for (j=0; j<nord; j++) if (order[j]==i) return j+1;
+        break;
+    }
+    return 0;
+}
+
+static void write_elf32(FILE *f) {
+    int i;
+    static const char shstrtab[] =
+        "\0.text\0.rel.text\0.symtab\0.strtab\0.shstrtab\0";
+    /*   0      1           7         17        25         33  */
+    int shstrtab_sz = (int)(sizeof shstrtab - 1);
+
+    /* .strtab: null byte + each symbol name */
+    static char strtab[MAX_ELFSY*128+1];
+    int strtab_offs[MAX_ELFSY], strtab_sz = 1;
+    strtab[0] = 0;
+    for (i=0; i<NELFSY; i++) {
+        strtab_offs[i] = strtab_sz;
+        int l = (int)strlen(ELFSY[i].name);
+        memcpy(strtab+strtab_sz, ELFSY[i].name, l+1);
+        strtab_sz += l+1;
+    }
+
+    int order[MAX_ELFSY], first_global, nord;
+    nord = elfsym_order(order, &first_global);
+
+    int sym_cnt    = 1 + nord;                     /* STN_UNDEF + symbols */
+    int symtab_sz  = sym_cnt * (int)sizeof(Elf32_Sym);
+    int reltext_sz = NELFRL  * (int)sizeof(Elf32_Rel);
+
+    uint32_t off_text     = (uint32_t)sizeof(Elf32_Ehdr);
+    uint32_t off_reltext  = off_text    + (uint32_t)gbn;
+    uint32_t off_symtab   = off_reltext + (uint32_t)reltext_sz;
+    uint32_t off_strtab   = off_symtab  + (uint32_t)symtab_sz;
+    uint32_t off_shstrtab = off_strtab  + (uint32_t)strtab_sz;
+    uint32_t off_shdrtab  = (off_shstrtab + (uint32_t)shstrtab_sz + 3u) & ~3u;
+
+    Elf32_Ehdr eh = {0};
+    eh.e_ident[0]=0x7f; eh.e_ident[1]='E'; eh.e_ident[2]='L'; eh.e_ident[3]='F';
+    eh.e_ident[4]=ELFCLASS32; eh.e_ident[5]=ELFDATA2LSB; eh.e_ident[6]=EV_CURRENT;
+    eh.e_type      = ET_REL;
+    eh.e_machine   = EM_386;
+    eh.e_version   = EV_CURRENT;
+    eh.e_shoff     = off_shdrtab;
+    eh.e_ehsize    = sizeof(Elf32_Ehdr);
+    eh.e_shentsize = sizeof(Elf32_Shdr);
+    eh.e_shnum     = 6;
+    eh.e_shstrndx  = 5;
+    fwrite(&eh, sizeof eh, 1, f);
+
+    fwrite(gbuf, 1, gbn, f);
+
+    for (i=0; i<NELFRL; i++) {
+        Elf32_Rel rel = {0};
+        rel.r_offset = (Elf32_Addr)ELFRL[i].off;
+        int si = elfsym_idx(ELFRL[i].sym, order, nord);
+        rel.r_info   = ELF32_R_INFO((uint32_t)si,
+                           (uint32_t)(ELFRL[i].pcrel ? R_386_PC32 : R_386_32));
+        fwrite(&rel, sizeof rel, 1, f);
+    }
+
+    Elf32_Sym snull = {0}; fwrite(&snull, sizeof snull, 1, f);
+    for (i=0; i<nord; i++) {
+        ElfSym *es = &ELFSY[order[i]];
+        Elf32_Sym sym = {0};
+        sym.st_name  = (Elf32_Word)strtab_offs[order[i]];
+        sym.st_value = es->def ? (Elf32_Addr)es->val : 0;
+        sym.st_shndx = es->def ? (Elf32_Half)es->secidx : SHN_UNDEF;
+        sym.st_info  = ELF32_ST_INFO(es->global ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
+        fwrite(&sym, sizeof sym, 1, f);
+    }
+
+    fwrite(strtab,   1, strtab_sz,   f);
+    fwrite(shstrtab, 1, shstrtab_sz, f);
+
+    uint32_t cur = off_shstrtab + (uint32_t)shstrtab_sz;
+    while (cur < off_shdrtab) { fputc(0,f); cur++; }
+
+    Elf32_Shdr sh = {0}; fwrite(&sh, sizeof sh, 1, f); /* [0] NULL */
+
+    sh = (Elf32_Shdr){0};
+    sh.sh_name=1; sh.sh_type=SHT_PROGBITS;
+    sh.sh_flags=SHF_ALLOC|SHF_EXECINSTR;
+    sh.sh_offset=(Elf32_Off)off_text; sh.sh_size=(Elf32_Word)gbn;
+    sh.sh_addralign=1;
+    fwrite(&sh, sizeof sh, 1, f); /* [1] .text */
+
+    sh = (Elf32_Shdr){0};
+    sh.sh_name=7; sh.sh_type=SHT_REL;
+    sh.sh_offset=(Elf32_Off)off_reltext; sh.sh_size=(Elf32_Word)reltext_sz;
+    sh.sh_link=3; sh.sh_info=1; sh.sh_addralign=4;
+    sh.sh_entsize=sizeof(Elf32_Rel);
+    fwrite(&sh, sizeof sh, 1, f); /* [2] .rel.text */
+
+    sh = (Elf32_Shdr){0};
+    sh.sh_name=17; sh.sh_type=SHT_SYMTAB;
+    sh.sh_offset=(Elf32_Off)off_symtab; sh.sh_size=(Elf32_Word)symtab_sz;
+    sh.sh_link=4; sh.sh_info=(Elf32_Word)first_global;
+    sh.sh_addralign=4; sh.sh_entsize=sizeof(Elf32_Sym);
+    fwrite(&sh, sizeof sh, 1, f); /* [3] .symtab */
+
+    sh = (Elf32_Shdr){0};
+    sh.sh_name=25; sh.sh_type=SHT_STRTAB;
+    sh.sh_offset=(Elf32_Off)off_strtab; sh.sh_size=(Elf32_Word)strtab_sz;
+    sh.sh_addralign=1;
+    fwrite(&sh, sizeof sh, 1, f); /* [4] .strtab */
+
+    sh = (Elf32_Shdr){0};
+    sh.sh_name=33; sh.sh_type=SHT_STRTAB;
+    sh.sh_offset=(Elf32_Off)off_shstrtab; sh.sh_size=(Elf32_Word)shstrtab_sz;
+    sh.sh_addralign=1;
+    fwrite(&sh, sizeof sh, 1, f); /* [5] .shstrtab */
+}
+
+static void write_elf64(FILE *f) {
+    int i;
+    static const char shstrtab[] =
+        "\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0";
+    /*   0      1            7          18        26         34  */
+    int shstrtab_sz = (int)(sizeof shstrtab - 1);
+
+    static char strtab[MAX_ELFSY*128+1];
+    int strtab_offs[MAX_ELFSY], strtab_sz = 1;
+    strtab[0] = 0;
+    for (i=0; i<NELFSY; i++) {
+        strtab_offs[i] = strtab_sz;
+        int l = (int)strlen(ELFSY[i].name);
+        memcpy(strtab+strtab_sz, ELFSY[i].name, l+1);
+        strtab_sz += l+1;
+    }
+
+    int order[MAX_ELFSY], first_global, nord;
+    nord = elfsym_order(order, &first_global);
+
+    int sym_cnt    = 1 + nord;
+    int symtab_sz  = sym_cnt * (int)sizeof(Elf64_Sym);
+    int reltext_sz = NELFRL  * (int)sizeof(Elf64_Rela);
+
+    uint64_t off_text     = sizeof(Elf64_Ehdr);
+    uint64_t off_reltext  = off_text    + gbn;
+    uint64_t off_symtab   = off_reltext + (uint64_t)reltext_sz;
+    uint64_t off_strtab   = off_symtab  + (uint64_t)symtab_sz;
+    uint64_t off_shstrtab = off_strtab  + (uint64_t)strtab_sz;
+    uint64_t off_shdrtab  = (off_shstrtab + (uint64_t)shstrtab_sz + 7u) & ~7ull;
+
+    Elf64_Ehdr eh = {0};
+    eh.e_ident[0]=0x7f; eh.e_ident[1]='E'; eh.e_ident[2]='L'; eh.e_ident[3]='F';
+    eh.e_ident[4]=ELFCLASS64; eh.e_ident[5]=ELFDATA2LSB; eh.e_ident[6]=EV_CURRENT;
+    eh.e_type      = ET_REL;
+    eh.e_machine   = EM_X86_64;
+    eh.e_version   = EV_CURRENT;
+    eh.e_shoff     = off_shdrtab;
+    eh.e_ehsize    = sizeof(Elf64_Ehdr);
+    eh.e_shentsize = sizeof(Elf64_Shdr);
+    eh.e_shnum     = 6;
+    eh.e_shstrndx  = 5;
+    fwrite(&eh, sizeof eh, 1, f);
+
+    fwrite(gbuf, 1, gbn, f);
+
+    for (i=0; i<NELFRL; i++) {
+        Elf64_Rela rela = {0};
+        rela.r_offset = ELFRL[i].off;
+        int si = elfsym_idx(ELFRL[i].sym, order, nord);
+        rela.r_info   = ELF64_R_INFO((uint64_t)si,
+                            (uint64_t)(ELFRL[i].pcrel ? R_X86_64_PC32 : R_X86_64_32));
+        rela.r_addend = ELFRL[i].pcrel ? -4LL : 0LL;
+        fwrite(&rela, sizeof rela, 1, f);
+    }
+
+    Elf64_Sym snull = {0}; fwrite(&snull, sizeof snull, 1, f);
+    for (i=0; i<nord; i++) {
+        ElfSym *es = &ELFSY[order[i]];
+        Elf64_Sym sym = {0};
+        sym.st_name  = (Elf64_Word)strtab_offs[order[i]];
+        sym.st_value = es->def ? (Elf64_Addr)es->val : 0;
+        sym.st_shndx = es->def ? (Elf64_Half)es->secidx : SHN_UNDEF;
+        sym.st_info  = ELF64_ST_INFO(es->global ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
+        fwrite(&sym, sizeof sym, 1, f);
+    }
+
+    fwrite(strtab,   1, strtab_sz,   f);
+    fwrite(shstrtab, 1, shstrtab_sz, f);
+
+    uint64_t cur = off_shstrtab + (uint64_t)shstrtab_sz;
+    while (cur < off_shdrtab) { fputc(0,f); cur++; }
+
+    Elf64_Shdr sh = {0}; fwrite(&sh, sizeof sh, 1, f); /* [0] NULL */
+
+    sh = (Elf64_Shdr){0};
+    sh.sh_name=1; sh.sh_type=SHT_PROGBITS;
+    sh.sh_flags=SHF_ALLOC|SHF_EXECINSTR;
+    sh.sh_offset=off_text; sh.sh_size=gbn;
+    sh.sh_addralign=1;
+    fwrite(&sh, sizeof sh, 1, f); /* [1] .text */
+
+    sh = (Elf64_Shdr){0};
+    sh.sh_name=7; sh.sh_type=SHT_RELA;
+    sh.sh_offset=off_reltext; sh.sh_size=(Elf64_Xword)reltext_sz;
+    sh.sh_link=3; sh.sh_info=1; sh.sh_addralign=8;
+    sh.sh_entsize=sizeof(Elf64_Rela);
+    fwrite(&sh, sizeof sh, 1, f); /* [2] .rela.text */
+
+    sh = (Elf64_Shdr){0};
+    sh.sh_name=18; sh.sh_type=SHT_SYMTAB;
+    sh.sh_offset=off_symtab; sh.sh_size=(Elf64_Xword)symtab_sz;
+    sh.sh_link=4; sh.sh_info=(Elf64_Word)first_global;
+    sh.sh_addralign=8; sh.sh_entsize=sizeof(Elf64_Sym);
+    fwrite(&sh, sizeof sh, 1, f); /* [3] .symtab */
+
+    sh = (Elf64_Shdr){0};
+    sh.sh_name=26; sh.sh_type=SHT_STRTAB;
+    sh.sh_offset=off_strtab; sh.sh_size=(Elf64_Xword)strtab_sz;
+    sh.sh_addralign=1;
+    fwrite(&sh, sizeof sh, 1, f); /* [4] .strtab */
+
+    sh = (Elf64_Shdr){0};
+    sh.sh_name=34; sh.sh_type=SHT_STRTAB;
+    sh.sh_offset=off_shstrtab; sh.sh_size=(Elf64_Xword)shstrtab_sz;
+    sh.sh_addralign=1;
+    fwrite(&sh, sizeof sh, 1, f); /* [5] .shstrtab */
+}
+
+/* ============================================================
  * Assembler Driver
  * ============================================================ */
 int handle(void) {
@@ -797,18 +1140,27 @@ int handle(void) {
     FSN = 0;
     if (preproc(inputFileName, 0) != 0) return EXIT_FAILURE;
 
-    /* Step 2: pass 1 — collect labels and EQU symbols */
+    /* Step 2: pass 1 — collect labels, EQU symbols, GLOBAL/EXTERN */
+    NELFSY = 0; NELFRL = 0;
     gpass = 1; gbn = 0; gbits = 16; gorg = 0;
     if (asmpass(FSRC) != 0) return EXIT_FAILURE;
 
-    /* Step 3: pass 2 — emit machine code */
+    /* Step 3: pass 2 — emit machine code and collect relocations */
+    NELFRL = 0;
     gpass = 2; gbn = 0; gbits = 16; gorg = 0;
     if (asmpass(FSRC) != 0) return EXIT_FAILURE;
 
     /* Step 4: write output */
     FILE *out = fopen(outputFileName,"wb");
     if (!out) { fprintf(stderr,"Error: cannot open '%s'\n",outputFileName); return EXIT_FAILURE; }
-    fwrite(gbuf,1,gbn,out); fclose(out);
+    if (gfmt == FMT_BIN) {
+        fwrite(gbuf,1,gbn,out);
+    } else if (gfmt == FMT_ELF64) {
+        write_elf64(out);
+    } else {
+        write_elf32(out);
+    }
+    fclose(out);
     printf("Assembled %zu byte%s -> %s\n", gbn, gbn==1?"":"s", outputFileName);
     return EXIT_SUCCESS;
 }
