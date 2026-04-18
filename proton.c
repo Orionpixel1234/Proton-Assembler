@@ -31,6 +31,7 @@ static int  NSYM;
 OutFmt gfmt = FMT_BIN;
 static long long g_entry = -1;
 
+
 static Sym *sfind(const char *n) {
     for (int i = 0; i < NSYM; i++)
         if (!strcmp(SYM[i].n, n)) return SYM + i;
@@ -173,16 +174,18 @@ typedef struct {
 } ElfSym;
 
 typedef struct {
-    uint64_t off;      /* byte offset of fixup within .text */
+    uint64_t off;      /* absolute gbuf offset of fixup (subtract section p2start for section-relative) */
     char     sym[128]; /* target symbol name */
     int      pcrel;    /* 1=PC-relative (R_*_PC32), 0=absolute (R_*_32) */
+    int      secidx;   /* SECS[] index of section containing this reloc */
 } ElfRel;
 
 static ElfSym ELFSY[MAX_ELFSY]; static int NELFSY;
 static ElfRel ELFRL[MAX_ELFRL]; static int NELFRL;
 
-/* Set by pprim() when it evaluates an undefined symbol during pass 2 */
+/* Set by pprim() when it evaluates a symbol during pass 2 */
 static const char *glast_undef;
+static const char *glast_sym;
 
 static ElfSym *elfsym_get(const char *n) {
     for (int i=0; i<NELFSY; i++) if (!strcmp(ELFSY[i].name,n)) return &ELFSY[i];
@@ -207,8 +210,10 @@ static long long pprim(void) {
     if (t->t==TLP)  { EP++; long long v=pexpr(); if (EP<EL&&ET[EP].t==TRP) EP++; return v; }
     if (t->t==TMNS) { EP++; return -pprim(); }
     if (t->t==TW)   { EP++; Sym *s=sfind(t->s);
-        if ((!s||!s->ok) && gpass==2 && (gfmt==FMT_ELF32||gfmt==FMT_ELF64))
-            glast_undef = t->s;
+        if (gpass==2 && (gfmt==FMT_ELF32||gfmt==FMT_ELF64)) {
+            glast_sym = t->s;
+            if (!s||!s->ok) glast_undef = t->s;
+        }
         return (s&&s->ok)?s->v:0; }
     EP++; return 0;
 }
@@ -237,10 +242,89 @@ static const char *R16[]={"AX","CX","DX","BX","SP","BP","SI","DI",0};
 static const char *R8[] ={"AL","CL","DL","BL","AH","CH","DH","BH",0};
 static const char *R32[]={"EAX","ECX","EDX","EBX","ESP","EBP","ESI","EDI",0};
 static const char *SREG[]={"ES","CS","SS","DS","FS","GS",0};
+static const char *R64[] = {"RAX","RCX","RDX","RBX","RSP","RBP","RSI","RDI","R8","R9","R10","R11","R12","R13","R14","R15",0};
+
 static int r16 (const char *n){for(int i=0;R16[i]; i++)if(!strcasecmp(n,R16[i])) return i;return -1;}
 static int r8  (const char *n){for(int i=0;R8[i];  i++)if(!strcasecmp(n,R8[i]))  return i;return -1;}
 static int r32 (const char *n){for(int i=0;R32[i]; i++)if(!strcasecmp(n,R32[i])) return i;return -1;}
+static int r64(const char *n) {for(int i=0;R64[i]; i++)if(!strcasecmp(n,R64[i])) return i;return -1;}
 static int sreg(const char *n){for(int i=0;SREG[i];i++)if(!strcasecmp(n,SREG[i]))return i;return -1;}
+static void rex(int w, int r, int x, int b) {
+    uint8_t p=0x40;if(w)p|=8;if(r)p|=4;if(x)p|=2;if(b)p|=1;E(p);
+}
+
+static int gdefrel = 0; /* [default rel] — symbols use RIP-relative */
+
+/* ---- Section tracking ---- */
+#define MAX_SECS 16
+typedef struct {
+    char     name[64];
+    size_t   p1start; /* gpc at section start (pass 1) */
+    size_t   p2start; /* gbn at section start (pass 2) */
+    size_t   sz;
+    uint32_t shtype;
+    uint64_t shflags;
+} Sec;
+static Sec SECS[MAX_SECS];
+static int NSECS = 0;
+static int CSEC  = -1;
+
+static int sec_get(const char *name) {
+    for (int i=0;i<NSECS;i++) if (!strcasecmp(SECS[i].name,name)) return i;
+    if (NSECS>=MAX_SECS) { fputs("too many sections\n",stderr); exit(1); }
+    int i=NSECS++;
+    strncpy(SECS[i].name,name,63);
+    if      (!strcasecmp(name,".text"))   {SECS[i].shtype=SHT_PROGBITS;SECS[i].shflags=SHF_ALLOC|SHF_EXECINSTR;}
+    else if (!strcasecmp(name,".rodata")) {SECS[i].shtype=SHT_PROGBITS;SECS[i].shflags=SHF_ALLOC;}
+    else if (!strcasecmp(name,".data"))   {SECS[i].shtype=SHT_PROGBITS;SECS[i].shflags=SHF_ALLOC|SHF_WRITE;}
+    else if (!strcasecmp(name,".bss"))    {SECS[i].shtype=SHT_NOBITS;  SECS[i].shflags=SHF_ALLOC|SHF_WRITE;}
+    else { SECS[i].shtype=SHT_PROGBITS; SECS[i].shflags=0; }
+    return i;
+}
+
+/* ============================================================
+ * 64-bit memory operand encoder
+ * ts[s..e] is the full [expr] token range including brackets.
+ * reg_f: low 3 bits of the register field (dest or src).
+ * ============================================================ */
+static void emit_mem64(Tok *ts, int s, int e, int reg_f) {
+    while (s<e && ts[s].t==TLB) s++;
+    while (e>s && ts[e-1].t==TRB) e--;
+
+    int base=-1;
+    if (s<e && ts[s].t==TW) { base=r64(ts[s].s); if (base>=0) s++; }
+
+    if (base>=0) {
+        long long disp=(s<e)?xeval(ts,s,e):0;
+        int rm=base&7;
+        if (rm==4) { /* RSP/R12: need SIB */
+            if (disp==0)                  { E(0x00|(reg_f<<3)|4); E(0x24); }
+            else if (disp>=-128&&disp<=127){ E(0x40|(reg_f<<3)|4); E(0x24); E((uint8_t)(int8_t)disp); }
+            else                          { E(0x80|(reg_f<<3)|4); E(0x24); E32((uint32_t)(int32_t)disp); }
+        } else if (rm==5&&disp==0) { /* RBP/R13: can't use mod=00, use mod=01 disp8=0 */
+            E(0x40|(reg_f<<3)|5); E(0x00);
+        } else if (disp==0)                { E(0x00|(reg_f<<3)|rm); }
+        else if (disp>=-128&&disp<=127)    { E(0x40|(reg_f<<3)|rm); E((uint8_t)(int8_t)disp); }
+        else                               { E(0x80|(reg_f<<3)|rm); E32((uint32_t)(int32_t)disp); }
+        return;
+    }
+
+    /* Symbol/address → RIP-relative (mod=00 rm=5) */
+    glast_sym=NULL; glast_undef=NULL;
+    long long sym_val=xeval(ts,s,e);
+    E((uint8_t)(0x00|(reg_f<<3)|5));
+    const char *sn = glast_sym ? glast_sym : glast_undef;
+    if (sn && gpass==2 && (gfmt==FMT_ELF64||gfmt==FMT_ELF32)) {
+        elfsym_get(sn); /* ensure in symtab */
+        if (NELFRL<MAX_ELFRL) {
+            ElfRel *rl=&ELFRL[NELFRL++];
+            rl->off=(uint64_t)gbn; rl->secidx=CSEC; strncpy(rl->sym,sn,127); rl->pcrel=1;
+        }
+        E32((uint32_t)(int32_t)-4);
+    } else {
+        E32((uint32_t)(int32_t)(sym_val-(long long)(gorg+gpc+4)));
+    }
+}
 
 /* ============================================================
  * Instruction Encoder — 16-bit x86
@@ -341,6 +425,7 @@ static int enc(Tok *ts, int n) {
     if (!strcmp(mn,"PUSH")) {
         int r = r16(ts[o1s].s); if (r>=0) { ospfx(0); E(0x50+r); return 0; }
             r = r32(ts[o1s].s); if (r>=0) { ospfx(1); E(0x50+r); return 0; }
+            r = r64(ts[o1s].s); if (r>=0) { rex(0,0,0,(r>>3)&1); E(0x50+(r&7)); return 0; }
         long long v = xeval(ts,o1s,o1e);
         if (v>=-128&&v<=127) { E(0x6A); E((uint8_t)(int8_t)v); }
         else                 { E(0x68); E16((uint16_t)v); }
@@ -349,6 +434,7 @@ static int enc(Tok *ts, int n) {
     if (!strcmp(mn,"POP")) {
         int r = r16(ts[o1s].s); if (r>=0) { ospfx(0); E(0x58+r); return 0; }
             r = r32(ts[o1s].s); if (r>=0) { ospfx(1); E(0x58+r); return 0; }
+            r = r64(ts[o1s].s); if (r>=0) { rex(0,0,0,(r>>3)&1); E(0x58+(r&7)); return 0; }
         fprintf(stderr,"POP: bad operand\n"); return -1;
     }
 
@@ -373,7 +459,7 @@ static int enc(Tok *ts, int n) {
                 ElfSym *es=elfsym_get(glast_undef); es->global=1;
                 if (NELFRL<MAX_ELFRL) {
                     ElfRel *rl=&ELFRL[NELFRL++];
-                    rl->off=(uint64_t)gbn; strncpy(rl->sym,glast_undef,127); rl->pcrel=1;
+                    rl->off=(uint64_t)gbn; rl->secidx=CSEC; strncpy(rl->sym,glast_undef,127); rl->pcrel=1;
                 }
                 E32((uint32_t)(int32_t)-4);
             } else {
@@ -390,21 +476,26 @@ static int enc(Tok *ts, int n) {
         glast_undef = NULL;
         long long tgt = xeval(ts,o1s,o1e);
         long long cur = (long long)(gorg+gpc);
-        if (gbits==32) {
-            E(0xE8);
-            if (glast_undef && gpass==2 && (gfmt==FMT_ELF32||gfmt==FMT_ELF64)) {
-                ElfSym *es=elfsym_get(glast_undef); es->global=1;
-                if (NELFRL<MAX_ELFRL) {
-                    ElfRel *rl=&ELFRL[NELFRL++];
-                    rl->off=(uint64_t)gbn; strncpy(rl->sym,glast_undef,127); rl->pcrel=1;
-                }
-                E32((uint32_t)(int32_t)-4);
-            } else {
-                E32((uint32_t)(int32_t)(tgt-(cur+5)));
+
+        E(0xE8);
+
+        if (glast_undef && gpass==2) {
+            ElfSym *es = elfsym_get(glast_undef);
+            es->global = 1;
+
+            if (NELFRL < MAX_ELFRL) {
+                ElfRel *rl = &ELFRL[NELFRL++];
+                rl->off = (uint64_t)gbn;
+                rl->secidx = CSEC;
+                strncpy(rl->sym, glast_undef, 127);
+                rl->pcrel = 1;
             }
+
+            E32((uint32_t)(int32_t)-4);
         } else {
-            E(0xE8); E16((uint16_t)(int16_t)(tgt-(cur+3)));
+            E32((uint32_t)(int32_t)(tgt-(cur+5)));
         }
+
         return 0;
     }
 
@@ -457,16 +548,16 @@ static int enc(Tok *ts, int n) {
     /* ---- Two-operand instructions ---- */
     if (co < 0) { fprintf(stderr,"Error: '%s' missing operands\n",mn); return -1; }
 
-    int d16=r16(ts[o1s].s), d8=r8(ts[o1s].s), d32=r32(ts[o1s].s), dsr=sreg(ts[o1s].s);
+    int d16=r16(ts[o1s].s), d8=r8(ts[o1s].s), d32=r32(ts[o1s].s), d64=r64(ts[o1s].s), dsr=sreg(ts[o1s].s);
     int dm = (ts[o1s].t==TLB);
     long long da = dm ? memop(ts,o1s,o1e) : 0;
 
-    int s16=-1, s8=-1, s32=-1, ssr=-1; long long imm=0;
+    int s16=-1, s8=-1, s32=-1, s64=-1, ssr=-1; long long imm=0;
     int sm = (o2s>=0 && ts[o2s].t==TLB);
     long long sa = sm ? memop(ts,o2s,o2e) : 0;
     if (!sm && o2s>=0) {
-        s16=r16(ts[o2s].s); s8=r8(ts[o2s].s); s32=r32(ts[o2s].s); ssr=sreg(ts[o2s].s);
-        if (s16<0 && s8<0 && s32<0 && ssr<0) imm=xeval(ts,o2s,o2e);
+        s16=r16(ts[o2s].s); s8=r8(ts[o2s].s); s32=r32(ts[o2s].s); s64=r64(ts[o2s].s); ssr=sreg(ts[o2s].s);
+        if (s16<0 && s8<0 && s32<0 && s64<0 && ssr<0) imm=xeval(ts,o2s,o2e);
     }
 
     /* ---- MOV ---- */
@@ -477,6 +568,9 @@ static int enc(Tok *ts, int n) {
         /* r32, r32  */ if (d32>=0&&s32>=0)                     { ospfx(1); E(0x89); E(0xC0|(s32<<3)|d32); return 0; }
         /* r16, imm  */ if (d16>=0&&!sm&&s8<0&&s16<0&&s32<0)   { ospfx(0); E(0xB8+d16); E16((uint16_t)imm); return 0; }
         /* r32, imm  */ if (d32>=0&&!sm&&s8<0&&s16<0&&s32<0)   { ospfx(1); E(0xB8+d32); E32((uint32_t)imm); return 0; }
+        /* r64, imm  */ if (d64>=0&&!sm&&s64<0)  { rex(1,0,0,(d64>>3)&1); E(0xC7); E((uint8_t)(0xC0|(d64&7))); E32((uint32_t)(int32_t)imm); return 0; }
+        /* r64, [m]  */ if (d64>=0&&sm)  { rex(1,(d64>>3)&1,0,0); E(0x8B); emit_mem64(ts,o2s,o2e,d64&7); return 0; }
+        /* [m], r64  */ if (dm&&s64>=0)  { rex(1,(s64>>3)&1,0,0); E(0x89); emit_mem64(ts,o1s,o1e,s64&7); return 0; }
         /* r16, [m]  */ if (d16>=0&&sm) {
             ospfx(0);
             if (d16==0) { E(0xA1); E16((uint16_t)sa); return 0; }
@@ -508,6 +602,7 @@ static int enc(Tok *ts, int n) {
         /* sreg, r32 */ if (dsr>=0&&s32>=0) { E(0x8E); E(0xC0|(dsr<<3)|s32); return 0; }
         /* sreg, r16 */ if (dsr>=0&&s16>=0) { E(0x8E); E(0xC0|(dsr<<3)|s16); return 0; }
         /* r16, sreg */ if (d16>=0&&ssr>=0) { E(0x8C); E(0xC0|(ssr<<3)|d16); return 0; }
+        /* r64, r64  */ if (d64>=0&&s64>=0) { rex(1,(s64>>3)&1,0,(d64>>3)&1); E(0x89); E((uint8_t)(0xC0|((s64&7)<<3)|(d64&7))); return 0; }
         fprintf(stderr,"MOV: unsupported operand combination\n"); return -1;
     }
 
@@ -543,6 +638,7 @@ static int enc(Tok *ts, int n) {
         if (d8>=0&&s8>=0)   { E(ALU[i].rr8);  E(0xC0|(s8<<3)|d8);  return 0; }
         if (d16>=0&&s16>=0) { ospfx(0); E(ALU[i].rr16); E(0xC0|(s16<<3)|d16); return 0; }
         if (d32>=0&&s32>=0) { ospfx(1); E(ALU[i].rr16); E(0xC0|(s32<<3)|d32); return 0; }
+        if (d64>=0&&s64>=0) { rex(1,(s64>>3)&1,0,(d64>>3)&1); E(ALU[i].rr16); E((uint8_t)(0xC0|((s64&7)<<3)|(d64&7))); return 0; }
         if (d8>=0)  { E(0x80); E(0xC0|(ALU[i].grp<<3)|d8); E((uint8_t)imm); return 0; }
         if (d16>=0) {
             ospfx(0);
@@ -554,6 +650,12 @@ static int enc(Tok *ts, int n) {
             ospfx(1);
             if (imm>=-128&&imm<=127) { E(0x83); E(0xC0|(ALU[i].grp<<3)|d32); E((uint8_t)(int8_t)imm); }
             else                     { E(0x81); E(0xC0|(ALU[i].grp<<3)|d32); E32((uint32_t)imm); }
+            return 0;
+        }
+        if (d64>=0) {
+            rex(1,0,0,(d64>>3)&1);
+            if (imm>=-128&&imm<=127) { E(0x83); E((uint8_t)(0xC0|(ALU[i].grp<<3)|(d64&7))); E((uint8_t)(int8_t)imm); }
+            else                     { E(0x81); E((uint8_t)(0xC0|(ALU[i].grp<<3)|(d64&7))); E32((uint32_t)(int32_t)imm); }
             return 0;
         }
         fprintf(stderr,"%s: bad operands\n",mn); return -1;
@@ -585,6 +687,14 @@ static int enc(Tok *ts, int n) {
             return 0;
         }
         fprintf(stderr,"%s: bad operand\n",mn); return -1;
+    }
+
+    /* ---- LEA ---- */
+    if (!strcmp(mn,"LEA")) {
+        if (d64>=0&&sm) { rex(1,(d64>>3)&1,0,0); E(0x8D); emit_mem64(ts,o2s,o2e,d64&7); return 0; }
+        if (d32>=0&&sm) { ospfx(1); E(0x8D); E((uint8_t)(0x06|(d32<<3))); E16((uint16_t)memop(ts,o2s,o2e)); return 0; }
+        if (d16>=0&&sm) { ospfx(0); E(0x8D); E((uint8_t)(0x06|(d16<<3))); E16((uint16_t)memop(ts,o2s,o2e)); return 0; }
+        fprintf(stderr,"LEA: unsupported operands\n"); return -1;
     }
 
     /* ---- MOVZX ---- */
@@ -694,11 +804,11 @@ static int asmpass(const char *src) {
             long long addr = (long long)(gorg + gpc);
             sset(ts[0].s, addr);
             if (gfmt==FMT_ELF32||gfmt==FMT_ELF64) {
-                ElfSym *e=elfsym_get(ts[0].s); e->def=1; e->secidx=1; e->val=(long long)gpc;
+                int si = (CSEC>=0) ? CSEC+1 : 1;
+                long long secrel = (CSEC>=0) ? (long long)(gpc - SECS[CSEC].p1start) : (long long)gpc;
+                ElfSym *e=elfsym_get(ts[0].s); e->def=1; e->secidx=si; e->val=secrel;
             }
-            if (gpass == 1 && !strcmp(ts[0].s, "_start")) {
-                g_entry = addr;
-            }
+            if (gpass == 1 && !strcmp(ts[0].s, "_start")) g_entry = addr;
             ti = 2;
         } else if (ts[0].t==TW && n>1 && ts[1].t==TW) {
             /* NASM allows label without colon before data: name DB/DW/DD/DQ/TIMES val */
@@ -708,12 +818,12 @@ static int asmpass(const char *src) {
                 long long addr = (long long)(gorg + gpc);
                 sset(ts[0].s, addr);
                 if (gfmt==FMT_ELF32||gfmt==FMT_ELF64) {
-                    ElfSym *e=elfsym_get(ts[0].s); e->def=1; e->secidx=1; e->val=(long long)gpc;
+                    int si = (CSEC>=0) ? CSEC+1 : 1;
+                    long long secrel = (CSEC>=0) ? (long long)(gpc - SECS[CSEC].p1start) : (long long)gpc;
+                    ElfSym *e=elfsym_get(ts[0].s); e->def=1; e->secidx=si; e->val=secrel;
                 }
-                if (gpass == 1 && !strcmp(ts[0].s, "_start")) {
-                    g_entry = addr;
-                }
-                ti = 1; /* process directive starting at ts[1] */
+                if (gpass == 1 && !strcmp(ts[0].s, "_start")) g_entry = addr;
+                ti = 1;
             }
         }
         if (ti >= end) { line++; continue; }
@@ -731,7 +841,11 @@ static int asmpass(const char *src) {
                     gbits = (int)xeval(rt,2,cl);
                 else if (!strcasecmp(dn,"INCLUDE"))
                     ; /* already flattened by preprocessor */
-                else if (gpass==2)
+                else if (!strcasecmp(dn,"DEFAULT")) {
+                    /* [default rel] — enable RIP-relative default */
+                    if (cl>2 && !strcasecmp(rt[2].s,"REL")) gdefrel=1;
+                    else if (cl>2 && !strcasecmp(rt[2].s,"ABS")) gdefrel=0;
+                } else if (gpass==2)
                     fprintf(stderr,"Warning: unknown directive [%s] line %d\n",dn,line);
             }
             line++; continue;
@@ -744,8 +858,18 @@ static int asmpass(const char *src) {
             d_buf[_di]=0;
             const char *d = d_buf;
 
-            /* SECTION — reset $$ */
-            if (!strcmp(d,"SECTION")) { gsec=gpc; line++; continue; }
+            /* SECTION — track section boundaries */
+            if (!strcmp(d,"SECTION")) {
+                if (rn>1 && rt[1].t==TW) {
+                    if (CSEC>=0 && gpass==1 && SECS[CSEC].sz==0)
+                        SECS[CSEC].sz = gpc - SECS[CSEC].p1start;
+                    int si=sec_get(rt[1].s);
+                    if (gpass==1) SECS[si].p1start=gpc;
+                    else          SECS[si].p2start=gbn;
+                    CSEC=si;
+                }
+                gsec=gpc; line++; continue;
+            }
             /* GLOBAL / EXTERN */
             if (!strcmp(d,"GLOBAL")) {
                 if (rn>1 && rt[1].t==TW) elfsym_get(rt[1].s)->global=1;
@@ -1025,111 +1149,137 @@ static void write_elf32(FILE *f) {
 
 static void write_elf64(FILE *f) {
     int i;
-    static const char shstrtab[] =
-        "\0.text\0.rela.text\0.symtab\0.strtab\0.shstrtab\0";
-    /*   0      1            7          18        26         34  */
-    int shstrtab_sz = (int)(sizeof shstrtab - 1);
+
+    /* Finalize section sizes */
+    if (NSECS==0) {
+        NSECS=1; strcpy(SECS[0].name,".text");
+        SECS[0].p2start=0; SECS[0].sz=gbn;
+        SECS[0].shtype=SHT_PROGBITS; SECS[0].shflags=SHF_ALLOC|SHF_EXECINSTR;
+    } else if (CSEC>=0 && SECS[CSEC].sz==0)
+        SECS[CSEC].sz = gbn - SECS[CSEC].p2start;
+
+    /* Build .shstrtab dynamically */
+    char shstrtab[4096]; int shstrtab_sz=1; shstrtab[0]=0;
+    int shname[MAX_SECS];
+    for (i=0;i<NSECS;i++) {
+        shname[i]=shstrtab_sz;
+        int l=(int)strlen(SECS[i].name)+1;
+        memcpy(shstrtab+shstrtab_sz,SECS[i].name,l); shstrtab_sz+=l;
+    }
+    /* Find which section has relocations (usually .text) */
+    int rela_sec=0; /* default to section 0 */
+    for (int j=0;j<NELFRL;j++) if (ELFRL[j].secidx>=0&&ELFRL[j].secidx<NSECS){rela_sec=ELFRL[j].secidx;break;}
+    char rela_name[72]; snprintf(rela_name,sizeof rela_name,".rela%s",SECS[rela_sec].name);
+    int shname_rela=shstrtab_sz;
+    { int l=(int)strlen(rela_name)+1; memcpy(shstrtab+shstrtab_sz,rela_name,l); shstrtab_sz+=l; }
+    int shname_symtab=shstrtab_sz; memcpy(shstrtab+shstrtab_sz,".symtab\0",8); shstrtab_sz+=8;
+    int shname_strtab=shstrtab_sz; memcpy(shstrtab+shstrtab_sz,".strtab\0",8); shstrtab_sz+=8;
+    int shname_shstrtab=shstrtab_sz; memcpy(shstrtab+shstrtab_sz,".shstrtab\0",10); shstrtab_sz+=10;
+
+    /* Section index layout: 0=NULL, 1..NSECS=data, NSECS+1=rela, NSECS+2=symtab, NSECS+3=strtab, NSECS+4=shstrtab */
+    int idx_rela=NSECS+1, idx_symtab=NSECS+2, idx_strtab=NSECS+3, idx_shstrtab=NSECS+4;
+    int total_secs=NSECS+5;
 
     static char strtab[MAX_ELFSY*128+1];
-    int strtab_offs[MAX_ELFSY], strtab_sz = 1;
-    strtab[0] = 0;
-    for (i=0; i<NELFSY; i++) {
-        strtab_offs[i] = strtab_sz;
-        int l = (int)strlen(ELFSY[i].name);
-        memcpy(strtab+strtab_sz, ELFSY[i].name, l+1);
-        strtab_sz += l+1;
+    int strtab_offs[MAX_ELFSY], strtab_sz=1; strtab[0]=0;
+    for (i=0;i<NELFSY;i++) {
+        strtab_offs[i]=strtab_sz;
+        int l=(int)strlen(ELFSY[i].name);
+        memcpy(strtab+strtab_sz,ELFSY[i].name,l+1); strtab_sz+=l+1;
     }
 
     int order[MAX_ELFSY], first_global, nord;
-    nord = elfsym_order(order, &first_global);
+    nord=elfsym_order(order,&first_global);
 
-    int sym_cnt    = 1 + nord;
-    int symtab_sz  = sym_cnt * (int)sizeof(Elf64_Sym);
-    int reltext_sz = NELFRL  * (int)sizeof(Elf64_Rela);
+    int symtab_sz=( 1+nord)*(int)sizeof(Elf64_Sym);
+    int rela_sz  =NELFRL   *(int)sizeof(Elf64_Rela);
 
-    uint64_t off_text     = sizeof(Elf64_Ehdr);
-    uint64_t off_reltext  = off_text    + gbn;
-    uint64_t off_symtab   = off_reltext + (uint64_t)reltext_sz;
-    uint64_t off_strtab   = off_symtab  + (uint64_t)symtab_sz;
-    uint64_t off_shstrtab = off_strtab  + (uint64_t)strtab_sz;
-    uint64_t off_shdrtab  = (off_shstrtab + (uint64_t)shstrtab_sz + 7u) & ~7ull;
+    uint64_t pos=sizeof(Elf64_Ehdr);
+    uint64_t off_data[MAX_SECS];
+    for (i=0;i<NSECS;i++) { off_data[i]=pos; pos+=SECS[i].sz; }
+    uint64_t off_rela    =pos; pos+=rela_sz;
+    uint64_t off_symtab  =pos; pos+=symtab_sz;
+    uint64_t off_strtab  =pos; pos+=strtab_sz;
+    uint64_t off_shstrtab=pos; pos+=shstrtab_sz;
+    uint64_t off_shdrtab =(pos+7u)&~7ull;
 
-    Elf64_Ehdr eh = {0};
-    eh.e_ident[0]=0x7f; eh.e_ident[1]='E'; eh.e_ident[2]='L'; eh.e_ident[3]='F';
-    eh.e_ident[4]=ELFCLASS64; eh.e_ident[5]=ELFDATA2LSB; eh.e_ident[6]=EV_CURRENT;
-    eh.e_type      = ET_REL;
-    eh.e_machine   = EM_X86_64;
-    eh.e_version   = EV_CURRENT;
-    eh.e_shoff     = off_shdrtab;
-    eh.e_ehsize    = sizeof(Elf64_Ehdr);
-    eh.e_shentsize = sizeof(Elf64_Shdr);
-    eh.e_shnum     = 6;
-    eh.e_shstrndx  = 5;
-    fwrite(&eh, sizeof eh, 1, f);
+    Elf64_Ehdr eh={0};
+    eh.e_ident[0]=0x7f;eh.e_ident[1]='E';eh.e_ident[2]='L';eh.e_ident[3]='F';
+    eh.e_ident[4]=ELFCLASS64;eh.e_ident[5]=ELFDATA2LSB;eh.e_ident[6]=EV_CURRENT;
+    eh.e_type=ET_REL;eh.e_machine=EM_X86_64;eh.e_version=EV_CURRENT;
+    eh.e_shoff=off_shdrtab;eh.e_ehsize=sizeof(Elf64_Ehdr);
+    eh.e_shentsize=sizeof(Elf64_Shdr);
+    eh.e_shnum=(Elf64_Half)total_secs;eh.e_shstrndx=(Elf64_Half)idx_shstrtab;
+    fwrite(&eh,sizeof eh,1,f);
 
-    fwrite(gbuf, 1, gbn, f);
+    for (i=0;i<NSECS;i++) fwrite(gbuf+SECS[i].p2start,1,SECS[i].sz,f);
 
-    for (i=0; i<NELFRL; i++) {
-        Elf64_Rela rela = {0};
-        rela.r_offset = ELFRL[i].off;
-        int si = elfsym_idx(ELFRL[i].sym, order, nord);
-        rela.r_info   = ELF64_R_INFO((uint64_t)si,
-                            (uint64_t)(ELFRL[i].pcrel ? R_X86_64_PC32 : R_X86_64_32));
-        rela.r_addend = ELFRL[i].pcrel ? -4LL : 0LL;
-        fwrite(&rela, sizeof rela, 1, f);
+    for (i=0;i<NELFRL;i++) {
+        Elf64_Rela r={0};
+        int rs=ELFRL[i].secidx; size_t base=(rs>=0&&rs<NSECS)?SECS[rs].p2start:0;
+        r.r_offset=ELFRL[i].off - (uint64_t)base;
+        int si=elfsym_idx(ELFRL[i].sym,order,nord);
+        r.r_info=ELF64_R_INFO((uint64_t)si,(uint64_t)(ELFRL[i].pcrel?R_X86_64_PC32:R_X86_64_32));
+        r.r_addend=ELFRL[i].pcrel?-4LL:0LL;
+        fwrite(&r,sizeof r,1,f);
     }
 
-    Elf64_Sym snull = {0}; fwrite(&snull, sizeof snull, 1, f);
-    for (i=0; i<nord; i++) {
-        ElfSym *es = &ELFSY[order[i]];
-        Elf64_Sym sym = {0};
-        sym.st_name  = (Elf64_Word)strtab_offs[order[i]];
-        sym.st_value = es->def ? (Elf64_Addr)es->val : 0;
-        sym.st_shndx = es->def ? (Elf64_Half)es->secidx : SHN_UNDEF;
-        sym.st_info  = ELF64_ST_INFO(es->global ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
-        fwrite(&sym, sizeof sym, 1, f);
+    {Elf64_Sym s={0};fwrite(&s,sizeof s,1,f);}
+    for (i=0;i<nord;i++) {
+        ElfSym *es=&ELFSY[order[i]];
+        Elf64_Sym s={0};
+        s.st_name=(Elf64_Word)strtab_offs[order[i]];
+        s.st_value=es->def?(Elf64_Addr)es->val:0;
+        s.st_shndx=es->def?(Elf64_Half)es->secidx:SHN_UNDEF;
+        s.st_info=ELF64_ST_INFO(es->global?STB_GLOBAL:STB_LOCAL,STT_NOTYPE);
+        fwrite(&s,sizeof s,1,f);
     }
 
-    fwrite(strtab,   1, strtab_sz,   f);
-    fwrite(shstrtab, 1, shstrtab_sz, f);
+    fwrite(strtab,1,strtab_sz,f);
+    fwrite(shstrtab,1,shstrtab_sz,f);
 
-    uint64_t cur = off_shstrtab + (uint64_t)shstrtab_sz;
-    while (cur < off_shdrtab) { fputc(0,f); cur++; }
+    uint64_t cur=off_shstrtab+(uint64_t)shstrtab_sz;
+    while (cur<off_shdrtab){fputc(0,f);cur++;}
 
-    Elf64_Shdr sh = {0}; fwrite(&sh, sizeof sh, 1, f); /* [0] NULL */
-
-    sh = (Elf64_Shdr){0};
-    sh.sh_name=1; sh.sh_type=SHT_PROGBITS;
-    sh.sh_flags=SHF_ALLOC|SHF_EXECINSTR;
-    sh.sh_offset=off_text; sh.sh_size=gbn;
-    sh.sh_addralign=1;
-    fwrite(&sh, sizeof sh, 1, f); /* [1] .text */
-
-    sh = (Elf64_Shdr){0};
-    sh.sh_name=7; sh.sh_type=SHT_RELA;
-    sh.sh_offset=off_reltext; sh.sh_size=(Elf64_Xword)reltext_sz;
-    sh.sh_link=3; sh.sh_info=1; sh.sh_addralign=8;
-    sh.sh_entsize=sizeof(Elf64_Rela);
-    fwrite(&sh, sizeof sh, 1, f); /* [2] .rela.text */
-
-    sh = (Elf64_Shdr){0};
-    sh.sh_name=18; sh.sh_type=SHT_SYMTAB;
-    sh.sh_offset=off_symtab; sh.sh_size=(Elf64_Xword)symtab_sz;
-    sh.sh_link=4; sh.sh_info=(Elf64_Word)first_global;
-    sh.sh_addralign=8; sh.sh_entsize=sizeof(Elf64_Sym);
-    fwrite(&sh, sizeof sh, 1, f); /* [3] .symtab */
-
-    sh = (Elf64_Shdr){0};
-    sh.sh_name=26; sh.sh_type=SHT_STRTAB;
-    sh.sh_offset=off_strtab; sh.sh_size=(Elf64_Xword)strtab_sz;
-    sh.sh_addralign=1;
-    fwrite(&sh, sizeof sh, 1, f); /* [4] .strtab */
-
-    sh = (Elf64_Shdr){0};
-    sh.sh_name=34; sh.sh_type=SHT_STRTAB;
-    sh.sh_offset=off_shstrtab; sh.sh_size=(Elf64_Xword)shstrtab_sz;
-    sh.sh_addralign=1;
-    fwrite(&sh, sizeof sh, 1, f); /* [5] .shstrtab */
+    /* Section headers */
+    {Elf64_Shdr sh={0};fwrite(&sh,sizeof sh,1,f);} /* [0] NULL */
+    for (i=0;i<NSECS;i++) {
+        Elf64_Shdr sh={0};
+        sh.sh_name=(Elf64_Word)shname[i];
+        sh.sh_type=(Elf64_Word)SECS[i].shtype;
+        sh.sh_flags=(Elf64_Xword)SECS[i].shflags;
+        sh.sh_offset=off_data[i]; sh.sh_size=SECS[i].sz;
+        sh.sh_addralign=1;
+        fwrite(&sh,sizeof sh,1,f);
+    }
+    {
+        Elf64_Shdr sh={0};
+        sh.sh_name=(Elf64_Word)shname_rela; sh.sh_type=SHT_RELA;
+        sh.sh_offset=off_rela; sh.sh_size=(Elf64_Xword)rela_sz;
+        sh.sh_link=(Elf64_Word)idx_symtab; sh.sh_info=(Elf64_Word)(rela_sec+1);
+        sh.sh_addralign=8; sh.sh_entsize=sizeof(Elf64_Rela);
+        fwrite(&sh,sizeof sh,1,f);
+    }
+    {
+        Elf64_Shdr sh={0};
+        sh.sh_name=(Elf64_Word)shname_symtab; sh.sh_type=SHT_SYMTAB;
+        sh.sh_offset=off_symtab; sh.sh_size=(Elf64_Xword)symtab_sz;
+        sh.sh_link=(Elf64_Word)idx_strtab; sh.sh_info=(Elf64_Word)first_global;
+        sh.sh_addralign=8; sh.sh_entsize=sizeof(Elf64_Sym);
+        fwrite(&sh,sizeof sh,1,f);
+    }
+    {
+        Elf64_Shdr sh={0};
+        sh.sh_name=(Elf64_Word)shname_strtab; sh.sh_type=SHT_STRTAB;
+        sh.sh_offset=off_strtab; sh.sh_size=(Elf64_Xword)strtab_sz;
+        sh.sh_addralign=1; fwrite(&sh,sizeof sh,1,f);
+    }
+    {
+        Elf64_Shdr sh={0};
+        sh.sh_name=(Elf64_Word)shname_shstrtab; sh.sh_type=SHT_STRTAB;
+        sh.sh_offset=off_shstrtab; sh.sh_size=(Elf64_Xword)shstrtab_sz;
+        sh.sh_addralign=1; fwrite(&sh,sizeof sh,1,f);
+    }
 }
 
 /* ============================================================
@@ -1140,13 +1290,13 @@ int handle(void) {
     FSN = 0;
     if (preproc(inputFileName, 0) != 0) return EXIT_FAILURE;
 
-    /* Step 2: pass 1 — collect labels, EQU symbols, GLOBAL/EXTERN */
-    NELFSY = 0; NELFRL = 0;
+    /* Step 2: pass 1 — collect labels, EQU symbols, GLOBAL/EXTERN, section sizes */
+    NELFSY = 0; NELFRL = 0; NSECS = 0; CSEC = -1; gdefrel = 0;
     gpass = 1; gbn = 0; gbits = 16; gorg = 0;
     if (asmpass(FSRC) != 0) return EXIT_FAILURE;
 
     /* Step 3: pass 2 — emit machine code and collect relocations */
-    NELFRL = 0;
+    NELFRL = 0; NSECS = 0; CSEC = -1; gdefrel = 0;
     gpass = 2; gbn = 0; gbits = 16; gorg = 0;
     if (asmpass(FSRC) != 0) return EXIT_FAILURE;
 
