@@ -1,2 +1,2 @@
-# Proton (TM) Assembler
+# Proton Assembler
 A Assembler for any Processor
